@@ -504,4 +504,11 @@ def get_incident_by_number(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    port = int(os.getenv("PORT", "8000"))
+
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=port,
+        streamable_http_path="/mcp",
+    )
