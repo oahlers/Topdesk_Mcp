@@ -349,22 +349,113 @@ def search_knowledge(
 
 
 @mcp.tool()
+@mcp.tool()
 def get_knowledge_item(
     identifier: str,
 ) -> dict[str, Any]:
-    """Get one TOPdesk Knowledge Item by UUID or complete KI number."""
+    """
+    Get one TOPdesk Knowledge Item by UUID or KI number.
+
+    Accepted examples:
+    - KI 0009
+    - KI0009
+    - 0009
+    - A TOPdesk Knowledge Item UUID
+    """
     identifier = identifier.strip()
 
     if not identifier:
         raise ValueError("identifier must not be empty")
 
-    data = knowledge_get(
-        f"/knowledgeItems/{quote(identifier, safe='')}",
-        params={"fields": KNOWLEDGE_FIELDS},
+    normalized_identifier = re.sub(
+        r"\s+",
+        " ",
+        identifier,
+    ).strip()
+
+    uuid_pattern = re.compile(
+        r"^[0-9a-fA-F]{8}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{12}$"
     )
 
-    return transform_knowledge_item(data)
+    # Hvis input allerede er et UUID, hentes artiklen direkte.
+    if uuid_pattern.fullmatch(normalized_identifier):
+        data = knowledge_get(
+            f"/knowledgeItems/{quote(normalized_identifier, safe='')}",
+            params={
+                "fields": KNOWLEDGE_FIELDS,
+            },
+        )
 
+        return transform_knowledge_item(data)
+
+    # Normaliser KI-nummeret.
+    number_part = re.sub(
+        r"^KI\s*",
+        "",
+        normalized_identifier,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if not number_part:
+        raise ValueError(
+            f"Invalid Knowledge Item identifier: {identifier}"
+        )
+
+    # Bevar eksisterende nuller, men understøt også fx "9".
+    if number_part.isdigit():
+        number_part = number_part.zfill(4)
+
+    expected_number = f"KI {number_part}".upper()
+
+    # Find først Knowledge Item via listen for at få UUID'et.
+    items = get_all_knowledge_items()
+
+    matching_item = None
+
+    for item in items:
+        item_number = str(
+            item.get("number")
+            or ""
+        ).strip().upper()
+
+        if item_number == expected_number:
+            matching_item = item
+            break
+
+    if matching_item is None:
+        raise ValueError(
+            f"Knowledge Item {expected_number} was not found."
+        )
+
+    knowledge_item_id = str(
+        matching_item.get("id")
+        or ""
+    ).strip()
+
+    if not knowledge_item_id:
+        raise ValueError(
+            f"Knowledge Item {expected_number} has no UUID."
+        )
+
+    # Hent derefter den komplette artikel via UUID.
+    data = knowledge_get(
+        f"/knowledgeItems/{quote(knowledge_item_id, safe='')}",
+        params={
+            "fields": KNOWLEDGE_FIELDS,
+        },
+    )
+
+    transformed = transform_knowledge_item(data)
+
+    # Sikrer nummeret, hvis detalje-endpointet ikke returnerer det.
+    if not transformed.get("number"):
+        transformed["number"] = expected_number
+
+    return transformed
 
 @mcp.tool()
 def list_recent_incidents(
