@@ -334,6 +334,21 @@ def get_metadata(path: str) -> list[dict[str, Any]]:
     return compact_metadata(extract_list(incident_get(path)))
 
 
+def format_user_choices(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Format TOPdesk metadata so users can choose by name and ID."""
+    choices = []
+    for index, item in enumerate(items, start=1):
+        item_id = str(item.get("id") or "").strip()
+        item_name = str(item.get("name") or "").strip()
+        choice = dict(item)
+        choice["number"] = index
+        choice["display"] = f"{index}. {item_name} (ID: {item_id})"
+        choices.append(choice)
+    return choices
+
+
 def validate_category_subcategory(
     category_id: str,
     subcategory_id: str,
@@ -707,16 +722,23 @@ def get_caller(caller_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def list_incident_categories() -> dict[str, Any]:
-    """List valid incident categories."""
+    """List all incident categories with name, ID, and display label."""
     items = get_metadata("/incidents/categories")
-    return {"status": "ok", "count": len(items), "categories": items}
+    choices = format_user_choices(items)
+    return {
+        "status": "ok",
+        "count": len(choices),
+        "categories": choices,
+        "question": "Vælg en kategori fra listen ved at angive nummer, navn eller ID.",
+        "displayFormat": "Nummer. Navn (ID: UUID)",
+    }
 
 
 @mcp.tool()
 def list_incident_subcategories(
     category_id: str = "",
 ) -> dict[str, Any]:
-    """List subcategories, optionally filtered by category UUID."""
+    """List subcategories with name and ID, optionally filtered by category."""
     items = get_metadata("/incidents/subcategories")
     category_id = category_id.strip()
     if category_id:
@@ -726,22 +748,32 @@ def list_incident_subcategories(
             if not item.get("categoryId")
             or item.get("categoryId") == category_id
         ]
+    choices = format_user_choices(items)
     return {
         "status": "ok",
         "categoryId": category_id,
-        "count": len(items),
-        "subcategories": items,
+        "count": len(choices),
+        "subcategories": choices,
+        "question": (
+            "Vælg en underkategori fra listen ved at angive nummer, navn eller ID."
+        ),
+        "displayFormat": "Nummer. Navn (ID: UUID)",
     }
 
 
 @mcp.tool()
 def list_operator_groups() -> dict[str, Any]:
-    """List valid TOPdesk operator groups."""
+    """List all operator groups with name, ID, and display label."""
     items = get_metadata("/incidents/operatorgroups/lookup")
+    choices = format_user_choices(items)
     return {
         "status": "ok",
-        "count": len(items),
-        "operatorGroups": items,
+        "count": len(choices),
+        "operatorGroups": choices,
+        "question": (
+            "Vælg en operatørgruppe fra listen ved at angive nummer, navn eller ID."
+        ),
+        "displayFormat": "Nummer. Navn (ID: UUID)",
     }
 
 
@@ -766,11 +798,17 @@ def find_operators(
             selected.append(operator)
         if len(selected) >= limit:
             break
+    operator_items = compact_metadata(selected, limit=limit)
+    choices = format_user_choices(operator_items)
     return {
         "status": "ok",
         "query": query,
-        "count": len(selected),
-        "operators": selected,
+        "count": len(choices),
+        "operators": choices,
+        "question": (
+            "Vælg en ansvarlig operatør fra listen ved at angive nummer, navn eller ID."
+        ),
+        "displayFormat": "Nummer. Navn (ID: UUID)",
         "note": (
             "TOPdesk validates that the selected operator belongs to the "
             "selected operator group when the incident is created."
@@ -998,9 +1036,37 @@ def incident_wizard_start(
         ),
         "callerCandidates": caller_candidates,
         "choices": {
-            "categories": get_metadata("/incidents/categories"),
-            "operatorGroups": get_metadata(
-                "/incidents/operatorgroups/lookup"
+            "categories": format_user_choices(
+                get_metadata("/incidents/categories")
+            ),
+            "operatorGroups": format_user_choices(
+                get_metadata("/incidents/operatorgroups/lookup")
+            ),
+        },
+        "selectionInstructions": {
+            "category": (
+                "Vis alle kategorier som 'Nummer. Navn (ID: UUID)' og bed "
+                "brugeren vælge en af de viste muligheder."
+            ),
+            "subcategory": (
+                "Når kategorien er valgt, kald "
+                "incident_wizard_get_subcategories med kategoriens ID, vis "
+                "alle underkategorier som 'Nummer. Navn (ID: UUID)', og bed "
+                "brugeren vælge en af de viste muligheder."
+            ),
+            "operatorGroup": (
+                "Vis alle operatørgrupper som 'Nummer. Navn (ID: UUID)' og "
+                "bed brugeren vælge en af de viste muligheder."
+            ),
+            "operator": (
+                "Når operatørgruppen er valgt, kald "
+                "incident_wizard_get_assignment_choices med gruppens ID, vis "
+                "alle operatører som 'Nummer. Navn (ID: UUID)', og bed "
+                "brugeren vælge en af de viste muligheder."
+            ),
+            "neverAskForUnknownId": (
+                "Bed aldrig brugeren skrive et ukendt TOPdesk-ID uden først "
+                "at vise de tilgængelige navne og ID'er."
             ),
         },
         "requiredSequence": [
@@ -1039,9 +1105,17 @@ def incident_wizard_get_assignment_choices(
     """
     operator_group_id = operator_group_id.strip()
     if not operator_group_id:
+        groups = format_user_choices(
+            get_metadata("/incidents/operatorgroups/lookup")
+        )
         return {
             "status": "needs_input",
-            "message": "Vælg først en operatørgruppe.",
+            "step": "operator_group",
+            "message": (
+                "Vælg først en operatørgruppe fra listen. Angiv nummer, navn eller ID."
+            ),
+            "operatorGroups": groups,
+            "displayFormat": "Nummer. Navn (ID: UUID)",
         }
 
     group = incident_get(
@@ -1057,9 +1131,11 @@ def incident_wizard_get_assignment_choices(
         "operatorGroup": group,
         "operators": operators.get("operators", []),
         "message": (
-            "Vælg en ansvarlig. TOPdesk validerer ved oprettelsen, at den "
+            "Vælg en ansvarlig operatør fra listen ved at angive nummer, "
+            "navn eller ID. TOPdesk validerer ved oprettelsen, at den "
             "ansvarlige tilhører den valgte gruppe."
         ),
+        "displayFormat": "Nummer. Navn (ID: UUID)",
     }
 
 
