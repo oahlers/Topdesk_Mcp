@@ -10,7 +10,6 @@ import requests
 from dotenv import load_dotenv
 from mcp.server import MCPServer
 
-
 load_dotenv()
 
 mcp = MCPServer("TOPdesk MCP")
@@ -25,7 +24,10 @@ TOPDESK_HOST = os.getenv(
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 KNOWLEDGE_PAGE_SIZE = int(os.getenv("KNOWLEDGE_PAGE_SIZE", "100"))
 INCIDENT_SCAN_LIMIT = int(os.getenv("INCIDENT_SCAN_LIMIT", "250"))
-WRITE_OPERATIONS_ENABLED = os.getenv("WRITE_OPERATIONS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+WRITE_OPERATIONS_ENABLED = os.getenv(
+    "WRITE_OPERATIONS_ENABLED",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 KNOWLEDGE_BASE_URL = f"{TOPDESK_HOST}/services/knowledge-base-v1"
 INCIDENT_BASE_URL = f"{TOPDESK_HOST}/tas/api"
@@ -38,19 +40,29 @@ KNOWLEDGE_FIELDS = (
 INCIDENT_FIELDS = (
     "id,number,briefDescription,request,action,creationDate,modificationDate,"
     "targetDate,closedDate,status,caller,operator,operatorGroup,category,"
-    "subcategory,callType,priority,urgency,impact,branch,location,object"
+    "subcategory,callType,priority,urgency,impact,branch,location,object,"
+    "processingStatus"
 )
+
+
+class TopdeskApiError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        response_text: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
 
 
 def validate_configuration() -> None:
     missing = []
-
     if not TOPDESK_USER:
         missing.append("TOPDESK_USER")
-
     if not TOPDESK_TOKEN:
         missing.append("TOPDESK_TOKEN")
-
     if missing:
         raise RuntimeError(
             "Missing environment variables: " + ", ".join(missing)
@@ -60,7 +72,6 @@ def validate_configuration() -> None:
 def clean_html(value: Any) -> str:
     if value is None:
         return ""
-
     text = html.unescape(str(value))
     text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(
@@ -74,7 +85,6 @@ def clean_html(value: Any) -> str:
     text = html.unescape(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n\n", text)
-
     return text.strip()
 
 
@@ -83,10 +93,10 @@ def scalar(value: Any) -> str:
         return str(
             value.get("name")
             or value.get("value")
+            or value.get("number")
             or value.get("id")
             or ""
         )
-
     return str(value or "")
 
 
@@ -98,66 +108,62 @@ def tokenize(query: str) -> list[str]:
     ]
 
 
-def topdesk_get(
+def topdesk_request(
+    method: str,
     base_url: str,
     path: str,
     params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
     accept: str = "application/json",
 ) -> Any:
     validate_configuration()
 
-    response = requests.get(
-        f"{base_url}{path}",
-        params=params,
-        auth=(TOPDESK_USER, TOPDESK_TOKEN),
-        headers={"Accept": accept},
-        timeout=REQUEST_TIMEOUT,
-    )
+    if method.upper() != "GET" and not WRITE_OPERATIONS_ENABLED:
+        raise PermissionError(
+            "TOPdesk write operations are disabled. "
+            "Set WRITE_OPERATIONS_ENABLED=true."
+        )
 
-    response.raise_for_status()
-
-    if not response.content:
-        return {}
-
-    return response.json()
-
-
-def topdesk_write(method: str, path: str, json_body: dict[str, Any], params: dict[str, Any] | None = None) -> Any:
-    validate_configuration()
-    if not WRITE_OPERATIONS_ENABLED:
-        raise PermissionError("TOPdesk write operations are disabled. Set WRITE_OPERATIONS_ENABLED=true.")
     response = requests.request(
         method=method.upper(),
-        url=f"{INCIDENT_BASE_URL}{path}",
+        url=f"{base_url}{path}",
         params=params,
         json=json_body,
         auth=(TOPDESK_USER, TOPDESK_TOKEN),
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        headers={
+            "Accept": accept,
+            "Content-Type": "application/json",
+        },
         timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
+
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise TopdeskApiError(
+            f"TOPdesk returned HTTP {response.status_code} for {path}.",
+            response.status_code,
+            response.text[:2000],
+        ) from exc
+
     if response.status_code == 204 or not response.content:
         return {}
+
     return response.json()
-
-
-def optional_reference(reference_id: str) -> dict[str, str] | None:
-    reference_id = reference_id.strip()
-    return {"id": reference_id} if reference_id else None
 
 
 def knowledge_get(
     path: str,
     params: dict[str, Any] | None = None,
 ) -> Any:
-    return topdesk_get(
+    return topdesk_request(
+        "GET",
         KNOWLEDGE_BASE_URL,
         path,
         params=params,
         accept=(
             "application/x.topdesk-kb-ki-list-v1+json, "
-            "application/x.topdesk-kb-ki-v1+json, "
-            "application/json"
+            "application/x.topdesk-kb-ki-v1+json, application/json"
         ),
     )
 
@@ -166,31 +172,51 @@ def incident_get(
     path: str,
     params: dict[str, Any] | None = None,
 ) -> Any:
-    return topdesk_get(
+    return topdesk_request(
+        "GET",
         INCIDENT_BASE_URL,
         path,
         params=params,
     )
 
 
+def incident_write(
+    method: str,
+    path: str,
+    json_body: dict[str, Any],
+    params: dict[str, Any] | None = None,
+) -> Any:
+    return topdesk_request(
+        method,
+        INCIDENT_BASE_URL,
+        path,
+        params=params,
+        json_body=json_body,
+    )
+
+
 def extract_list(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return data
-
     if isinstance(data, dict):
-        for key in ("item", "items", "results", "data"):
+        for key in (
+            "item",
+            "items",
+            "results",
+            "data",
+            "persons",
+            "operators",
+            "operatorGroups",
+        ):
             value = data.get(key)
-
             if isinstance(value, list):
                 return value
-
     return []
 
 
 def transform_knowledge_item(item: dict[str, Any]) -> dict[str, Any]:
-    translation = item.get("translation", {})
-    content = translation.get("content", {})
-
+    translation = item.get("translation") or {}
+    content = translation.get("content") or {}
     return {
         "id": str(item.get("id") or ""),
         "number": str(item.get("number") or ""),
@@ -205,7 +231,7 @@ def transform_knowledge_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def transform_incident(item: dict[str, Any]) -> dict[str, Any]:
-    transformed = {
+    result = {
         "id": str(item.get("id") or ""),
         "number": str(item.get("number") or ""),
         "briefDescription": clean_html(item.get("briefDescription", "")),
@@ -216,7 +242,6 @@ def transform_incident(item: dict[str, Any]) -> dict[str, Any]:
         "targetDate": str(item.get("targetDate") or ""),
         "closedDate": str(item.get("closedDate") or ""),
     }
-
     for name in (
         "status",
         "caller",
@@ -231,59 +256,14 @@ def transform_incident(item: dict[str, Any]) -> dict[str, Any]:
         "branch",
         "location",
         "object",
+        "processingStatus",
     ):
-        transformed[name] = scalar(item.get(name))
-
-    return transformed
-
-
-def knowledge_score(
-    item: dict[str, Any],
-    terms: list[str],
-) -> int:
-    weighted_fields = (
-        (item.get("number", "").lower(), 100),
-        (item.get("title", "").lower(), 25),
-        (item.get("keywords", "").lower(), 20),
-        (item.get("description", "").lower(), 12),
-        (item.get("content", "").lower(), 8),
-    )
-
-    return sum(
-        weight
-        for term in terms
-        for text, weight in weighted_fields
-        if term in text
-    )
-
-
-def incident_score(
-    item: dict[str, Any],
-    terms: list[str],
-) -> int:
-    weighted_fields = (
-        (item.get("number", "").lower(), 100),
-        (item.get("briefDescription", "").lower(), 30),
-        (item.get("request", "").lower(), 20),
-        (item.get("action", "").lower(), 12),
-        (item.get("category", "").lower(), 10),
-        (item.get("subcategory", "").lower(), 10),
-        (item.get("status", "").lower(), 8),
-        (item.get("caller", "").lower(), 6),
-        (item.get("operator", "").lower(), 6),
-        (item.get("operatorGroup", "").lower(), 6),
-    )
-
-    return sum(
-        weight
-        for term in terms
-        for text, weight in weighted_fields
-        if term in text
-    )
+        result[name] = scalar(item.get(name))
+    return result
 
 
 def get_all_knowledge_items() -> list[dict[str, Any]]:
-    all_items = []
+    items: list[dict[str, Any]] = []
     start = 0
 
     while True:
@@ -295,37 +275,171 @@ def get_all_knowledge_items() -> list[dict[str, Any]]:
                 "fields": KNOWLEDGE_FIELDS,
             },
         )
+        page = extract_list(data)
+        items.extend(page)
 
-        page_items = extract_list(data)
-        all_items.extend(page_items)
-
-        if not page_items:
+        if not page:
             break
-
         if not isinstance(data, dict) or not data.get("next"):
             break
+        start += len(page)
 
-        start += len(page_items)
+    return items
 
-    return all_items
+
+def normalize_ki_number(identifier: str) -> str:
+    value = re.sub(r"\s+", " ", identifier.strip()).upper()
+    value = re.sub(r"^KI\s*", "", value).strip()
+    if value.isdigit():
+        value = value.zfill(4)
+    return f"KI {value}"
+
+
+def is_uuid(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            value.strip(),
+        )
+    )
+
+
+def compact_metadata(
+    items: list[dict[str, Any]],
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    compact = []
+    for item in items[:limit]:
+        row: dict[str, Any] = {
+            "id": str(item.get("id") or item.get("value") or ""),
+            "name": str(
+                item.get("name")
+                or item.get("text")
+                or item.get("value")
+                or ""
+            ),
+        }
+        category = item.get("category")
+        if isinstance(category, dict):
+            row["categoryId"] = str(category.get("id") or "")
+            row["categoryName"] = str(category.get("name") or "")
+        compact.append(row)
+    return compact
+
+
+def get_metadata(path: str) -> list[dict[str, Any]]:
+    return compact_metadata(extract_list(incident_get(path)))
+
+
+def validate_category_subcategory(
+    category_id: str,
+    subcategory_id: str,
+) -> dict[str, Any]:
+    subcategories = get_metadata("/incidents/subcategories")
+    selected = next(
+        (
+            item
+            for item in subcategories
+            if item.get("id") == subcategory_id
+        ),
+        None,
+    )
+
+    if selected is None:
+        return {
+            "valid": False,
+            "message": "Den valgte underkategori findes ikke.",
+        }
+
+    linked_category_id = str(selected.get("categoryId") or "")
+    if linked_category_id and linked_category_id != category_id:
+        return {
+            "valid": False,
+            "message": (
+                "Den valgte underkategori tilhører ikke den valgte kategori."
+            ),
+        }
+
+    return {"valid": True}
+
+
+def required_wizard_fields(
+    brief_description: str,
+    caller_id: str,
+    request_text: str,
+    category_id: str,
+    subcategory_id: str,
+    operator_group_id: str,
+    operator_id: str,
+) -> list[str]:
+    values = {
+        "brief_description": brief_description,
+        "caller_id": caller_id,
+        "request_text": request_text,
+        "category_id": category_id,
+        "subcategory_id": subcategory_id,
+        "operator_group_id": operator_group_id,
+        "operator_id": operator_id,
+    }
+    return [
+        name
+        for name, value in values.items()
+        if not value.strip()
+    ]
+
+
+def build_second_line_payload(
+    brief_description: str,
+    caller_id: str,
+    request_text: str,
+    category_id: str,
+    subcategory_id: str,
+    operator_group_id: str,
+    operator_id: str,
+    call_type_id: str = "",
+    impact_id: str = "",
+    urgency_id: str = "",
+    priority_id: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "secondLine",
+        "briefDescription": brief_description.strip(),
+        "request": request_text.strip(),
+        "callerLookup": {"id": caller_id.strip()},
+        "category": {"id": category_id.strip()},
+        "subcategory": {"id": subcategory_id.strip()},
+        "operatorGroup": {"id": operator_group_id.strip()},
+        "operator": {"id": operator_id.strip()},
+    }
+
+    optional_fields = {
+        "callType": call_type_id,
+        "impact": impact_id,
+        "urgency": urgency_id,
+        "priority": priority_id,
+    }
+    for field_name, reference_id in optional_fields.items():
+        if reference_id.strip():
+            payload[field_name] = {"id": reference_id.strip()}
+
+    return payload
 
 
 @mcp.tool()
 def health() -> dict[str, Any]:
-    """Check whether the MCP server has the required TOPdesk configuration."""
+    """Check configuration and write-operation status."""
     missing = []
-
     if not TOPDESK_USER:
         missing.append("TOPDESK_USER")
-
     if not TOPDESK_TOKEN:
         missing.append("TOPDESK_TOKEN")
-
     return {
         "status": "ok" if not missing else "configuration_error",
         "missingVariables": missing,
         "topdeskHost": TOPDESK_HOST,
         "writeOperationsEnabled": WRITE_OPERATIONS_ENABLED,
+        "defaultIncidentLine": "secondLine",
     }
 
 
@@ -334,28 +448,33 @@ def search_knowledge(
     query: str,
     limit: int = 7,
 ) -> dict[str, Any]:
-    """Search TOPdesk Knowledge Base and return the most relevant articles."""
+    """Search TOPdesk Knowledge Base."""
     query = query.strip()
     limit = max(1, min(limit, 10))
-
     if not query:
         raise ValueError("query must not be empty")
 
     terms = tokenize(query)
-    transformed_items = [
-        transform_knowledge_item(item)
-        for item in get_all_knowledge_items()
-    ]
-
     results = []
 
-    for item in transformed_items:
-        score = knowledge_score(item, terms)
-
-        if score > 0:
-            result = dict(item)
-            result["relevanceScore"] = score
-            results.append(result)
+    for raw in get_all_knowledge_items():
+        item = transform_knowledge_item(raw)
+        weighted_fields = (
+            (item.get("number", "").lower(), 100),
+            (item.get("title", "").lower(), 25),
+            (item.get("keywords", "").lower(), 20),
+            (item.get("description", "").lower(), 12),
+            (item.get("content", "").lower(), 8),
+        )
+        score = sum(
+            weight
+            for term in terms
+            for text, weight in weighted_fields
+            if term in text
+        )
+        if score:
+            item["relevanceScore"] = score
+            results.append(item)
 
     results.sort(
         key=lambda item: (
@@ -366,7 +485,6 @@ def search_knowledge(
     )
 
     selected = results[:limit]
-
     return {
         "query": query,
         "count": len(selected),
@@ -375,113 +493,47 @@ def search_knowledge(
 
 
 @mcp.tool()
-@mcp.tool()
-def get_knowledge_item(
-    identifier: str,
-) -> dict[str, Any]:
-    """
-    Get one TOPdesk Knowledge Item by UUID or KI number.
-
-    Accepted examples:
-    - KI 0009
-    - KI0009
-    - 0009
-    - A TOPdesk Knowledge Item UUID
-    """
+def get_knowledge_item(identifier: str) -> dict[str, Any]:
+    """Get a Knowledge Item by UUID or KI number."""
     identifier = identifier.strip()
-
     if not identifier:
         raise ValueError("identifier must not be empty")
 
-    normalized_identifier = re.sub(
-        r"\s+",
-        " ",
-        identifier,
-    ).strip()
+    if is_uuid(identifier):
+        return transform_knowledge_item(
+            knowledge_get(
+                f"/knowledgeItems/{quote(identifier, safe='')}",
+                params={"fields": KNOWLEDGE_FIELDS},
+            )
+        )
 
-    uuid_pattern = re.compile(
-        r"^[0-9a-fA-F]{8}-"
-        r"[0-9a-fA-F]{4}-"
-        r"[0-9a-fA-F]{4}-"
-        r"[0-9a-fA-F]{4}-"
-        r"[0-9a-fA-F]{12}$"
+    expected_number = normalize_ki_number(identifier)
+    match = next(
+        (
+            item
+            for item in get_all_knowledge_items()
+            if str(item.get("number") or "").strip().upper()
+            == expected_number
+        ),
+        None,
     )
+    if match is None:
+        raise ValueError(f"Knowledge Item {expected_number} was not found.")
 
-    # Hvis input allerede er et UUID, hentes artiklen direkte.
-    if uuid_pattern.fullmatch(normalized_identifier):
-        data = knowledge_get(
-            f"/knowledgeItems/{quote(normalized_identifier, safe='')}",
-            params={
-                "fields": KNOWLEDGE_FIELDS,
-            },
+    item_id = str(match.get("id") or "").strip()
+    if not item_id:
+        raise ValueError(f"Knowledge Item {expected_number} has no UUID.")
+
+    result = transform_knowledge_item(
+        knowledge_get(
+            f"/knowledgeItems/{quote(item_id, safe='')}",
+            params={"fields": KNOWLEDGE_FIELDS},
         )
-
-        return transform_knowledge_item(data)
-
-    # Normaliser KI-nummeret.
-    number_part = re.sub(
-        r"^KI\s*",
-        "",
-        normalized_identifier,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    if not number_part:
-        raise ValueError(
-            f"Invalid Knowledge Item identifier: {identifier}"
-        )
-
-    # Bevar eksisterende nuller, men understøt også fx "9".
-    if number_part.isdigit():
-        number_part = number_part.zfill(4)
-
-    expected_number = f"KI {number_part}".upper()
-
-    # Find først Knowledge Item via listen for at få UUID'et.
-    items = get_all_knowledge_items()
-
-    matching_item = None
-
-    for item in items:
-        item_number = str(
-            item.get("number")
-            or ""
-        ).strip().upper()
-
-        if item_number == expected_number:
-            matching_item = item
-            break
-
-    if matching_item is None:
-        raise ValueError(
-            f"Knowledge Item {expected_number} was not found."
-        )
-
-    knowledge_item_id = str(
-        matching_item.get("id")
-        or ""
-    ).strip()
-
-    if not knowledge_item_id:
-        raise ValueError(
-            f"Knowledge Item {expected_number} has no UUID."
-        )
-
-    # Hent derefter den komplette artikel via UUID.
-    data = knowledge_get(
-        f"/knowledgeItems/{quote(knowledge_item_id, safe='')}",
-        params={
-            "fields": KNOWLEDGE_FIELDS,
-        },
     )
+    if not result.get("number"):
+        result["number"] = expected_number
+    return result
 
-    transformed = transform_knowledge_item(data)
-
-    # Sikrer nummeret, hvis detalje-endpointet ikke returnerer det.
-    if not transformed.get("number"):
-        transformed["number"] = expected_number
-
-    return transformed
 
 @mcp.tool()
 def list_recent_incidents(
@@ -489,55 +541,46 @@ def list_recent_incidents(
     start: int = 0,
     status: str = "",
 ) -> dict[str, Any]:
-    """List recent accessible TOPdesk incidents, optionally filtered by status."""
+    """List recent accessible incidents."""
     limit = max(1, min(limit, 100))
-    start = max(0, start)
-    status_filter = status.strip().lower()
-
     data = incident_get(
         "/incidents",
         params={
-            "pageStart": start,
+            "pageStart": max(0, start),
             "pageSize": limit,
             "sort": "creationDate:desc",
             "dateFormat": "iso8601",
             "fields": INCIDENT_FIELDS,
         },
     )
-
     incidents = [
         transform_incident(item)
         for item in extract_list(data)
     ]
-
+    status_filter = status.strip().lower()
     if status_filter:
         incidents = [
             item
             for item in incidents
             if status_filter in item.get("status", "").lower()
         ]
-
-    return {
-        "count": len(incidents),
-        "start": start,
-        "limit": limit,
-        "incidents": incidents,
-    }
+    return {"count": len(incidents), "incidents": incidents}
 
 
 @mcp.tool()
 def search_incidents(
     query: str,
     limit: int = 7,
-    scan: int = 250,
+    scan: int = INCIDENT_SCAN_LIMIT,
 ) -> dict[str, Any]:
-    """Search recent TOPdesk incidents and return 5 to 10 relevant references."""
+    """Search recent accessible incidents."""
     query = query.strip()
-    limit = max(5, min(limit, 10))
-    scan = max(25, min(scan, 1000))
-
     if not query:
         raise ValueError("query must not be empty")
+
+    limit = max(1, min(limit, 25))
+    scan = max(25, min(scan, 1000))
+    terms = tokenize(query)
 
     data = incident_get(
         "/incidents",
@@ -550,21 +593,27 @@ def search_incidents(
         },
     )
 
-    incidents = [
-        transform_incident(item)
-        for item in extract_list(data)
-    ]
-
-    terms = tokenize(query)
     results = []
-
-    for incident in incidents:
-        score = incident_score(incident, terms)
-
-        if score > 0:
-            result = dict(incident)
-            result["relevanceScore"] = score
-            results.append(result)
+    for raw in extract_list(data):
+        item = transform_incident(raw)
+        weighted_fields = (
+            (item.get("number", "").lower(), 100),
+            (item.get("briefDescription", "").lower(), 30),
+            (item.get("request", "").lower(), 20),
+            (item.get("action", "").lower(), 12),
+            (item.get("category", "").lower(), 10),
+            (item.get("subcategory", "").lower(), 10),
+            (item.get("caller", "").lower(), 6),
+        )
+        score = sum(
+            weight
+            for term in terms
+            for text, weight in weighted_fields
+            if term in text
+        )
+        if score:
+            item["relevanceScore"] = score
+            results.append(item)
 
     results.sort(
         key=lambda item: (
@@ -573,129 +622,270 @@ def search_incidents(
         ),
         reverse=True,
     )
-
     selected = results[:limit]
-
     return {
         "query": query,
-        "scanned": len(incidents),
         "count": len(selected),
         "references": selected,
     }
 
 
 @mcp.tool()
-def get_incident_by_id(
-    incident_id: str,
-) -> dict[str, Any]:
-    """Get one TOPdesk incident by UUID."""
+def get_incident_by_id(incident_id: str) -> dict[str, Any]:
+    """Get an incident by UUID."""
     incident_id = incident_id.strip()
-
     if not incident_id:
         raise ValueError("incident_id must not be empty")
-
-    data = incident_get(
-        f"/incidents/id/{quote(incident_id, safe='')}",
-        params={"dateFormat": "iso8601"},
+    return transform_incident(
+        incident_get(
+            f"/incidents/id/{quote(incident_id, safe='')}",
+            params={"dateFormat": "iso8601"},
+        )
     )
-
-    return transform_incident(data)
 
 
 @mcp.tool()
-def get_incident_by_number(
-    number: str,
-) -> dict[str, Any]:
-    """Get one TOPdesk incident by its complete incident number."""
+def get_incident_by_number(number: str) -> dict[str, Any]:
+    """Get an incident by number."""
     number = number.strip()
-
     if not number:
         raise ValueError("number must not be empty")
-
-    data = incident_get(
-        f"/incidents/number/{quote(number, safe='')}",
-        params={"dateFormat": "iso8601"},
+    return transform_incident(
+        incident_get(
+            f"/incidents/number/{quote(number, safe='')}",
+            params={"dateFormat": "iso8601"},
+        )
     )
-
-    return transform_incident(data)
 
 
 @mcp.tool()
-def find_callers(query: str, limit: int = 20) -> dict[str, Any]:
-    """Find TOPdesk callers and UUIDs for incident creation."""
+def find_callers(
+    query: str,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Find caller candidates for the incident wizard."""
     query = query.strip().lower()
     limit = max(1, min(limit, 100))
-    data = incident_get("/incidents/callers/lookup", params={"pageStart": 0, "pageSize": 1000})
-    callers = extract_list(data)
+    callers = extract_list(
+        incident_get(
+            "/incidents/callers/lookup",
+            params={"pageStart": 0, "pageSize": 1000},
+        )
+    )
     selected = []
     for caller in callers:
-        searchable = " ".join(str(value) for value in caller.values()).lower()
-        if not query or query in searchable:
+        text = " ".join(str(value) for value in caller.values()).lower()
+        if not query or query in text:
             selected.append(caller)
         if len(selected) >= limit:
             break
-    return {"status": "ok", "query": query, "count": len(selected), "callers": selected}
+    return {
+        "status": "ok",
+        "query": query,
+        "count": len(selected),
+        "callers": selected,
+    }
 
 
 @mcp.tool()
 def get_caller(caller_id: str) -> dict[str, Any]:
-    """Get one TOPdesk caller by UUID."""
+    """Get a caller by UUID."""
     caller_id = caller_id.strip()
     if not caller_id:
         raise ValueError("caller_id must not be empty")
-    return {"status": "ok", "caller": incident_get(f"/incidents/callers/lookup/{quote(caller_id, safe='')}")}
+    return {
+        "status": "ok",
+        "caller": incident_get(
+            f"/incidents/callers/lookup/{quote(caller_id, safe='')}"
+        ),
+    }
 
 
-def get_metadata_list(path: str) -> list[dict[str, Any]]:
-    return extract_list(incident_get(path))
+@mcp.tool()
+def list_incident_categories() -> dict[str, Any]:
+    """List valid incident categories."""
+    items = get_metadata("/incidents/categories")
+    return {"status": "ok", "count": len(items), "categories": items}
 
 
-def compact_metadata(items: list[dict[str, Any]], limit: int = 50) -> list[dict[str, str]]:
-    return [
-        {
-            "id": str(item.get("id") or item.get("value") or ""),
-            "name": str(item.get("name") or item.get("text") or item.get("value") or ""),
-        }
-        for item in items[:limit]
-    ]
+@mcp.tool()
+def list_incident_subcategories(
+    category_id: str = "",
+) -> dict[str, Any]:
+    """List subcategories, optionally filtered by category UUID."""
+    items = get_metadata("/incidents/subcategories")
+    category_id = category_id.strip()
+    if category_id:
+        items = [
+            item
+            for item in items
+            if not item.get("categoryId")
+            or item.get("categoryId") == category_id
+        ]
+    return {
+        "status": "ok",
+        "categoryId": category_id,
+        "count": len(items),
+        "subcategories": items,
+    }
+
+
+@mcp.tool()
+def list_operator_groups() -> dict[str, Any]:
+    """List valid TOPdesk operator groups."""
+    items = get_metadata("/incidents/operatorgroups/lookup")
+    return {
+        "status": "ok",
+        "count": len(items),
+        "operatorGroups": items,
+    }
+
+
+@mcp.tool()
+def find_operators(
+    query: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Find responsible operators for assignment."""
+    query = query.strip().lower()
+    limit = max(1, min(limit, 100))
+    operators = extract_list(
+        incident_get(
+            "/incidents/operators/lookup",
+            params={"pageStart": 0, "pageSize": 1000},
+        )
+    )
+    selected = []
+    for operator in operators:
+        text = " ".join(str(value) for value in operator.values()).lower()
+        if not query or query in text:
+            selected.append(operator)
+        if len(selected) >= limit:
+            break
+    return {
+        "status": "ok",
+        "query": query,
+        "count": len(selected),
+        "operators": selected,
+        "note": (
+            "TOPdesk validates that the selected operator belongs to the "
+            "selected operator group when the incident is created."
+        ),
+    }
+
+
+@mcp.tool()
+def get_operator(operator_id: str) -> dict[str, Any]:
+    """Get a responsible operator by UUID."""
+    operator_id = operator_id.strip()
+    if not operator_id:
+        raise ValueError("operator_id must not be empty")
+    return {
+        "status": "ok",
+        "operator": incident_get(
+            f"/incidents/operators/lookup/{quote(operator_id, safe='')}"
+        ),
+    }
 
 
 @mcp.tool()
 def create_incident(
     brief_description: str,
     caller_id: str,
-    request_text: str = "",
-    category_id: str = "",
-    subcategory_id: str = "",
+    request_text: str,
+    category_id: str,
+    subcategory_id: str,
+    operator_group_id: str,
+    operator_id: str,
     call_type_id: str = "",
     impact_id: str = "",
     urgency_id: str = "",
     priority_id: str = "",
     confirmed: bool = False,
 ) -> dict[str, Any]:
-    """Create an incident only after explicit confirmation."""
-    brief_description = brief_description.strip()
-    caller_id = caller_id.strip()
-    if not brief_description:
-        raise ValueError("brief_description must not be empty")
-    if len(brief_description) > 80:
-        raise ValueError("brief_description must be 80 characters or fewer")
-    if not caller_id:
-        raise ValueError("caller_id must not be empty")
-    payload: dict[str, Any] = {"briefDescription": brief_description, "caller": {"id": caller_id}}
-    if request_text.strip():
-        payload["request"] = request_text.strip()
-    for field_name, reference_id in {
-        "category": category_id, "subcategory": subcategory_id, "callType": call_type_id,
-        "impact": impact_id, "urgency": urgency_id, "priority": priority_id,
-    }.items():
-        reference = optional_reference(reference_id)
-        if reference:
-            payload[field_name] = reference
+    """
+    Create a Second Line incident with mandatory classification and assignment.
+    """
+    missing = required_wizard_fields(
+        brief_description,
+        caller_id,
+        request_text,
+        category_id,
+        subcategory_id,
+        operator_group_id,
+        operator_id,
+    )
+    if missing:
+        return {
+            "status": "needs_input",
+            "missingFields": missing,
+        }
+
+    if len(brief_description.strip()) > 80:
+        return {
+            "status": "needs_input",
+            "message": "Titlen må højst indeholde 80 tegn.",
+        }
+
+    relationship = validate_category_subcategory(
+        category_id.strip(),
+        subcategory_id.strip(),
+    )
+    if not relationship.get("valid"):
+        return {
+            "status": "invalid_classification",
+            "message": relationship.get("message"),
+        }
+
+    payload = build_second_line_payload(
+        brief_description=brief_description,
+        caller_id=caller_id,
+        request_text=request_text,
+        category_id=category_id,
+        subcategory_id=subcategory_id,
+        operator_group_id=operator_group_id,
+        operator_id=operator_id,
+        call_type_id=call_type_id,
+        impact_id=impact_id,
+        urgency_id=urgency_id,
+        priority_id=priority_id,
+    )
+
     if not confirmed:
-        return {"status": "confirmation_required", "operation": "create_incident", "proposedIncident": payload}
-    data = topdesk_write("POST", "/incidents", payload, params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS})
-    return {"status": "created", "incident": transform_incident(data)}
+        return {
+            "status": "confirmation_required",
+            "operation": "create_incident",
+            "proposedIncident": payload,
+        }
+
+    try:
+        data = incident_write(
+            "POST",
+            "/incidents",
+            payload,
+            params={
+                "dateFormat": "iso8601",
+                "fields": INCIDENT_FIELDS,
+            },
+        )
+    except TopdeskApiError as error:
+        if error.status_code == 400:
+            return {
+                "status": "invalid_assignment_or_classification",
+                "httpStatus": 400,
+                "message": (
+                    "TOPdesk afviste kombinationen. Kontrollér at "
+                    "underkategorien tilhører kategorien, og at den "
+                    "ansvarlige tilhører den valgte operatørgruppe."
+                ),
+                "topdeskResponse": error.response_text,
+            }
+        raise
+
+    return {
+        "status": "created",
+        "incident": transform_incident(data),
+    }
 
 
 @mcp.tool()
@@ -704,36 +894,61 @@ def update_incident_by_number(
     action_text: str = "",
     request_text: str = "",
     brief_description: str = "",
-    status_id: str = "",
-    priority_id: str = "",
-    operator_id: str = "",
+    category_id: str = "",
+    subcategory_id: str = "",
     operator_group_id: str = "",
+    operator_id: str = "",
+    priority_id: str = "",
     confirmed: bool = False,
 ) -> dict[str, Any]:
-    """Update common fields on an incident by number after confirmation."""
+    """Update selected incident fields after explicit confirmation."""
     number = number.strip()
     if not number:
         raise ValueError("number must not be empty")
+
     payload: dict[str, Any] = {}
-    if action_text.strip(): payload["action"] = action_text.strip()
-    if request_text.strip(): payload["request"] = request_text.strip()
+    if action_text.strip():
+        payload["action"] = action_text.strip()
+    if request_text.strip():
+        payload["request"] = request_text.strip()
     if brief_description.strip():
         if len(brief_description.strip()) > 80:
             raise ValueError("brief_description must be 80 characters or fewer")
         payload["briefDescription"] = brief_description.strip()
+
     for field_name, reference_id in {
-        "status": status_id, "priority": priority_id,
-        "operator": operator_id, "operatorGroup": operator_group_id,
+        "category": category_id,
+        "subcategory": subcategory_id,
+        "operatorGroup": operator_group_id,
+        "operator": operator_id,
+        "priority": priority_id,
     }.items():
-        reference = optional_reference(reference_id)
-        if reference:
-            payload[field_name] = reference
+        if reference_id.strip():
+            payload[field_name] = {"id": reference_id.strip()}
+
     if not payload:
         raise ValueError("At least one update field must be provided")
+
     if not confirmed:
-        return {"status": "confirmation_required", "incidentNumber": number, "proposedChanges": payload}
-    data = topdesk_write("PATCH", f"/incidents/number/{quote(number, safe='')}", payload, params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS})
-    return {"status": "updated", "incident": transform_incident(data)}
+        return {
+            "status": "confirmation_required",
+            "incidentNumber": number,
+            "proposedChanges": payload,
+        }
+
+    data = incident_write(
+        "PATCH",
+        f"/incidents/number/{quote(number, safe='')}",
+        payload,
+        params={
+            "dateFormat": "iso8601",
+            "fields": INCIDENT_FIELDS,
+        },
+    )
+    return {
+        "status": "updated",
+        "incident": transform_incident(data),
+    }
 
 
 @mcp.tool()
@@ -743,30 +958,103 @@ def incident_wizard_start(
     knowledge_limit: int = 3,
     incident_limit: int = 3,
 ) -> dict[str, Any]:
-    """Start Wizard V1 without writing data."""
+    """Start Incident Wizard V1 without changing TOPdesk data."""
     problem = problem.strip()
     if not problem:
-        return {"status": "needs_input", "step": "problem", "question": "Beskriv kort problemet."}
+        return {
+            "status": "needs_input",
+            "step": "problem",
+            "question": "Beskriv kort problemet.",
+        }
+
     caller_candidates = (
         find_callers(caller_query, 10)
         if caller_query.strip()
-        else {"status": "needs_input", "question": "Gælder sagen dig selv eller en kollega?", "callers": []}
+        else {
+            "status": "needs_input",
+            "question": "Gælder sagen dig selv eller en kollega?",
+            "callers": [],
+        }
     )
+
     return {
         "status": "wizard_started",
         "step": "review_existing_help",
+        "defaultIncidentLine": "secondLine",
         "problem": problem,
-        "knowledge": search_knowledge(problem, max(1, min(knowledge_limit, 5))),
-        "similarIncidents": search_incidents(problem, max(1, min(incident_limit, 5)), INCIDENT_SCAN_LIMIT),
+        "knowledge": search_knowledge(
+            problem,
+            max(1, min(knowledge_limit, 5)),
+        ),
+        "similarIncidents": search_incidents(
+            problem,
+            max(1, min(incident_limit, 5)),
+            INCIDENT_SCAN_LIMIT,
+        ),
         "callerCandidates": caller_candidates,
         "choices": {
-            "categories": compact_metadata(get_metadata_list("/incidents/categories")),
-            "callTypes": compact_metadata(get_metadata_list("/incidents/call_types")),
-            "impacts": compact_metadata(get_metadata_list("/incidents/impacts")),
-            "urgencies": compact_metadata(get_metadata_list("/incidents/urgencies")),
-            "priorities": compact_metadata(get_metadata_list("/incidents/priorities")),
+            "categories": get_metadata("/incidents/categories"),
+            "operatorGroups": get_metadata(
+                "/incidents/operatorgroups/lookup"
+            ),
         },
-        "nextQuestion": "Vis relevant hjælp og spørg, om brugeren stadig vil oprette en sag.",
+        "requiredSequence": [
+            "caller",
+            "category",
+            "subcategory",
+            "operatorGroup",
+            "operator",
+            "preview",
+            "confirmation",
+        ],
+        "nextQuestion": (
+            "Vis højst tre relevante hjælpeforslag og spørg, om brugeren "
+            "stadig ønsker at oprette en Second Line-sag."
+        ),
+    }
+
+
+@mcp.tool()
+def incident_wizard_get_subcategories(
+    category_id: str,
+) -> dict[str, Any]:
+    """Get only the undercategories belonging to the selected category."""
+    return list_incident_subcategories(category_id=category_id)
+
+
+@mcp.tool()
+def incident_wizard_get_assignment_choices(
+    operator_group_id: str,
+    operator_query: str = "",
+) -> dict[str, Any]:
+    """
+    Return the selected group and operator candidates.
+
+    TOPdesk performs the final membership validation at creation time.
+    """
+    operator_group_id = operator_group_id.strip()
+    if not operator_group_id:
+        return {
+            "status": "needs_input",
+            "message": "Vælg først en operatørgruppe.",
+        }
+
+    group = incident_get(
+        f"/incidents/operatorgroups/lookup/"
+        f"{quote(operator_group_id, safe='')}"
+    )
+    operators = find_operators(
+        query=operator_query,
+        limit=100,
+    )
+    return {
+        "status": "ok",
+        "operatorGroup": group,
+        "operators": operators.get("operators", []),
+        "message": (
+            "Vælg en ansvarlig. TOPdesk validerer ved oprettelsen, at den "
+            "ansvarlige tilhører den valgte gruppe."
+        ),
     }
 
 
@@ -775,41 +1063,101 @@ def incident_wizard_preview(
     brief_description: str,
     caller_id: str,
     request_text: str,
-    category_id: str = "",
-    subcategory_id: str = "",
+    category_id: str,
+    subcategory_id: str,
+    operator_group_id: str,
+    operator_id: str,
     call_type_id: str = "",
     impact_id: str = "",
     urgency_id: str = "",
     priority_id: str = "",
 ) -> dict[str, Any]:
-    """Validate the draft and return a non-writing final preview."""
-    missing = [name for name, value in {
-        "brief_description": brief_description,
-        "caller_id": caller_id,
-        "request_text": request_text,
-    }.items() if not value.strip()]
+    """Validate and preview a complete Second Line wizard draft."""
+    missing = required_wizard_fields(
+        brief_description,
+        caller_id,
+        request_text,
+        category_id,
+        subcategory_id,
+        operator_group_id,
+        operator_id,
+    )
     if missing:
-        return {"status": "needs_input", "missingFields": missing}
+        return {
+            "status": "needs_input",
+            "step": "incident_details",
+            "missingFields": missing,
+            "message": (
+                "Kategori, underkategori, operatørgruppe og ansvarlig "
+                "skal vælges før preview."
+            ),
+        }
+
     if len(brief_description.strip()) > 80:
-        return {"status": "needs_input", "message": "Titlen må højst indeholde 80 tegn."}
-    payload: dict[str, Any] = {
-        "briefDescription": brief_description.strip(),
-        "request": request_text.strip(),
-        "caller": {"id": caller_id.strip()},
-    }
-    for field_name, reference_id in {
-        "category": category_id, "subcategory": subcategory_id, "callType": call_type_id,
-        "impact": impact_id, "urgency": urgency_id, "priority": priority_id,
-    }.items():
-        reference = optional_reference(reference_id)
-        if reference:
-            payload[field_name] = reference
+        return {
+            "status": "needs_input",
+            "message": "Titlen må højst indeholde 80 tegn.",
+        }
+
+    relationship = validate_category_subcategory(
+        category_id.strip(),
+        subcategory_id.strip(),
+    )
+    if not relationship.get("valid"):
+        return {
+            "status": "invalid_classification",
+            "message": relationship.get("message"),
+        }
+
+    payload = build_second_line_payload(
+        brief_description=brief_description,
+        caller_id=caller_id,
+        request_text=request_text,
+        category_id=category_id,
+        subcategory_id=subcategory_id,
+        operator_group_id=operator_group_id,
+        operator_id=operator_id,
+        call_type_id=call_type_id,
+        impact_id=impact_id,
+        urgency_id=urgency_id,
+        priority_id=priority_id,
+    )
+
     return {
         "status": "confirmation_required",
         "step": "confirm",
+        "incidentLine": "secondLine",
         "caller": get_caller(caller_id.strip()),
+        "category": next(
+            (
+                item
+                for item in get_metadata("/incidents/categories")
+                if item.get("id") == category_id.strip()
+            ),
+            {"id": category_id.strip()},
+        ),
+        "subcategory": next(
+            (
+                item
+                for item in get_metadata("/incidents/subcategories")
+                if item.get("id") == subcategory_id.strip()
+            ),
+            {"id": subcategory_id.strip()},
+        ),
+        "operatorGroup": incident_get(
+            f"/incidents/operatorgroups/lookup/"
+            f"{quote(operator_group_id.strip(), safe='')}"
+        ),
+        "operator": get_operator(operator_id.strip()),
         "proposedIncident": payload,
-        "allowedAnswers": ["Ja, opret sagen", "Rediger", "Annuller"],
+        "allowedAnswers": [
+            "Ja, opret sagen",
+            "Rediger kategori",
+            "Rediger underkategori",
+            "Rediger gruppe",
+            "Rediger ansvarlig",
+            "Annuller",
+        ],
     }
 
 
@@ -818,23 +1166,31 @@ def incident_wizard_submit(
     brief_description: str,
     caller_id: str,
     request_text: str,
-    category_id: str = "",
-    subcategory_id: str = "",
+    category_id: str,
+    subcategory_id: str,
+    operator_group_id: str,
+    operator_id: str,
     call_type_id: str = "",
     impact_id: str = "",
     urgency_id: str = "",
     priority_id: str = "",
     confirmed: bool = False,
 ) -> dict[str, Any]:
-    """Create the final Wizard draft after explicit confirmation."""
+    """Submit the complete wizard draft as a Second Line incident."""
     if not confirmed:
-        return {"status": "confirmation_required", "message": "Brugeren skal eksplicit bekræfte oprettelsen."}
+        return {
+            "status": "confirmation_required",
+            "message": "Brugeren skal eksplicit bekræfte oprettelsen.",
+        }
+
     result = create_incident(
         brief_description=brief_description,
         caller_id=caller_id,
         request_text=request_text,
         category_id=category_id,
         subcategory_id=subcategory_id,
+        operator_group_id=operator_group_id,
+        operator_id=operator_id,
         call_type_id=call_type_id,
         impact_id=impact_id,
         urgency_id=urgency_id,
@@ -843,12 +1199,12 @@ def incident_wizard_submit(
     )
     if result.get("status") == "created":
         result["wizardStatus"] = "completed"
+        result["incidentLine"] = "secondLine"
     return result
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-
     mcp.run(
         transport="streamable-http",
         host="0.0.0.0",
