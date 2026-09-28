@@ -334,6 +334,97 @@ def get_metadata(path: str) -> list[dict[str, Any]]:
     return compact_metadata(extract_list(incident_get(path)))
 
 
+def is_masked_operator_name(value: Any) -> bool:
+    """Return True when TOPdesk has returned an empty or masked display name."""
+    text = str(value or "").strip()
+    if not text:
+        return True
+    without_separators = re.sub(r"[\s*._-]+", "", text)
+    return not without_separators
+
+
+def first_unmasked_text(*values: Any) -> str:
+    """Return the first non-empty, non-masked text value."""
+    for value in values:
+        text = clean_html(value).strip()
+        if text and not is_masked_operator_name(text):
+            return text
+    return ""
+
+
+def extract_operator_name(operator: dict[str, Any]) -> str:
+    """Extract the best available real operator name from a TOPdesk response."""
+    person = operator.get("person")
+    person = person if isinstance(person, dict) else {}
+
+    first_name = first_unmasked_text(
+        operator.get("firstName"),
+        operator.get("firstname"),
+        person.get("firstName"),
+        person.get("firstname"),
+    )
+    last_name = first_unmasked_text(
+        operator.get("surName"),
+        operator.get("surname"),
+        operator.get("lastName"),
+        operator.get("lastname"),
+        person.get("surName"),
+        person.get("surname"),
+        person.get("lastName"),
+        person.get("lastname"),
+    )
+    combined_name = " ".join(
+        part for part in (first_name, last_name) if part
+    ).strip()
+    if combined_name:
+        return combined_name
+
+    return first_unmasked_text(
+        operator.get("dynamicName"),
+        operator.get("fullName"),
+        operator.get("displayName"),
+        person.get("dynamicName"),
+        person.get("fullName"),
+        person.get("displayName"),
+        person.get("name"),
+        operator.get("name"),
+        operator.get("text"),
+    )
+
+
+def resolve_operator_choice(
+    operator: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    """Resolve an operator name, using the detail endpoint when needed."""
+    operator_id = str(
+        operator.get("id")
+        or operator.get("value")
+        or ""
+    ).strip()
+    operator_name = extract_operator_name(operator)
+
+    if operator_id and not operator_name:
+        try:
+            detail = incident_get(
+                f"/incidents/operators/lookup/{quote(operator_id, safe='')}"
+            )
+            if isinstance(detail, dict):
+                operator_name = extract_operator_name(detail)
+        except TopdeskApiError:
+            operator_name = ""
+
+    if not operator_name:
+        operator_name = f"Operatør {index}"
+
+    return {
+        "id": operator_id,
+        "name": operator_name,
+        "number": index,
+        "display": f"({index}) {operator_name} (ID: {operator_id})",
+    }
+
+
 def format_user_choices(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -782,7 +873,7 @@ def find_operators(
     query: str = "",
     limit: int = 50,
 ) -> dict[str, Any]:
-    """Find responsible operators for assignment."""
+    """Find responsible operators while preserving their real TOPdesk names."""
     query = query.strip().lower()
     limit = max(1, min(limit, 100))
     operators = extract_list(
@@ -791,20 +882,38 @@ def find_operators(
             params={"pageStart": 0, "pageSize": 1000},
         )
     )
-    selected = []
+
+    resolved_operators = []
     for operator in operators:
-        text = " ".join(str(value) for value in operator.values()).lower()
-        if not query or query in text:
-            selected.append(operator)
-        if len(selected) >= limit:
+        if not isinstance(operator, dict):
+            continue
+        choice = resolve_operator_choice(
+            operator,
+            len(resolved_operators) + 1,
+        )
+        searchable_text = " ".join(
+            (
+                choice.get("name", ""),
+                choice.get("id", ""),
+                " ".join(str(value) for value in operator.values()),
+            )
+        ).lower()
+        if query and query not in searchable_text:
+            continue
+        choice["number"] = len(resolved_operators) + 1
+        choice["display"] = (
+            f"({choice['number']}) {choice['name']} "
+            f"(ID: {choice['id']})"
+        )
+        resolved_operators.append(choice)
+        if len(resolved_operators) >= limit:
             break
-    operator_items = compact_metadata(selected, limit=limit)
-    choices = format_user_choices(operator_items)
+
     return {
         "status": "ok",
         "query": query,
-        "count": len(choices),
-        "operators": choices,
+        "count": len(resolved_operators),
+        "operators": resolved_operators,
         "question": (
             "Vælg en ansvarlig operatør fra listen ved at angive nummer, navn eller ID."
         ),
