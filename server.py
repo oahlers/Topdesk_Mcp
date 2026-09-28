@@ -31,6 +31,7 @@ WRITE_OPERATIONS_ENABLED = os.getenv(
 
 KNOWLEDGE_BASE_URL = f"{TOPDESK_HOST}/services/knowledge-base-v1"
 INCIDENT_BASE_URL = f"{TOPDESK_HOST}/tas/api"
+DEFAULT_ENTRY_TYPE_NAME = "Chat"
 
 KNOWLEDGE_FIELDS = (
     "title,description,content,keywords,urls,modificationDate,"
@@ -40,7 +41,7 @@ KNOWLEDGE_FIELDS = (
 INCIDENT_FIELDS = (
     "id,number,briefDescription,request,action,creationDate,modificationDate,"
     "targetDate,closedDate,status,caller,operator,operatorGroup,category,"
-    "subcategory,callType,priority,urgency,impact,branch,location,object,"
+    "subcategory,callType,entryType,priority,urgency,impact,branch,location,object,"
     "processingStatus"
 )
 
@@ -250,6 +251,7 @@ def transform_incident(item: dict[str, Any]) -> dict[str, Any]:
         "category",
         "subcategory",
         "callType",
+        "entryType",
         "priority",
         "urgency",
         "impact",
@@ -407,6 +409,7 @@ def build_second_line_payload(
         "briefDescription": brief_description.strip(),
         "request": request_text.strip(),
         "callerLookup": {"id": caller_id.strip()},
+        "entryType": {"name": DEFAULT_ENTRY_TYPE_NAME},
         "category": {"id": category_id.strip()},
         "subcategory": {"id": subcategory_id.strip()},
         "operatorGroup": {"id": operator_group_id.strip()},
@@ -440,6 +443,7 @@ def health() -> dict[str, Any]:
         "topdeskHost": TOPDESK_HOST,
         "writeOperationsEnabled": WRITE_OPERATIONS_ENABLED,
         "defaultIncidentLine": "secondLine",
+        "defaultEntryType": DEFAULT_ENTRY_TYPE_NAME,
     }
 
 
@@ -981,6 +985,7 @@ def incident_wizard_start(
         "status": "wizard_started",
         "step": "review_existing_help",
         "defaultIncidentLine": "secondLine",
+        "defaultEntryType": DEFAULT_ENTRY_TYPE_NAME,
         "problem": problem,
         "knowledge": search_knowledge(
             problem,
