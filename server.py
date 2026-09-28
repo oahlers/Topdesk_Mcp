@@ -622,7 +622,7 @@ def get_incident_by_number(
 
 @mcp.tool()
 def find_callers(query: str, limit: int = 20) -> dict[str, Any]:
-    """Find TOPdesk callers and their UUIDs for incident creation."""
+    """Find TOPdesk callers and UUIDs for incident creation."""
     query = query.strip().lower()
     limit = max(1, min(limit, 100))
     data = incident_get("/incidents/callers/lookup", params={"pageStart": 0, "pageSize": 1000})
@@ -646,6 +646,20 @@ def get_caller(caller_id: str) -> dict[str, Any]:
     return {"status": "ok", "caller": incident_get(f"/incidents/callers/lookup/{quote(caller_id, safe='')}")}
 
 
+def get_metadata_list(path: str) -> list[dict[str, Any]]:
+    return extract_list(incident_get(path))
+
+
+def compact_metadata(items: list[dict[str, Any]], limit: int = 50) -> list[dict[str, str]]:
+    return [
+        {
+            "id": str(item.get("id") or item.get("value") or ""),
+            "name": str(item.get("name") or item.get("text") or item.get("value") or ""),
+        }
+        for item in items[:limit]
+    ]
+
+
 @mcp.tool()
 def create_incident(
     brief_description: str,
@@ -659,7 +673,7 @@ def create_incident(
     priority_id: str = "",
     confirmed: bool = False,
 ) -> dict[str, Any]:
-    """Create an incident after explicit confirmation. Caller UUID is required."""
+    """Create an incident only after explicit confirmation."""
     brief_description = brief_description.strip()
     caller_id = caller_id.strip()
     if not brief_description:
@@ -687,70 +701,26 @@ def create_incident(
 @mcp.tool()
 def update_incident_by_number(
     number: str,
-    brief_description: str = "",
-    request_text: str = "",
     action_text: str = "",
-    category_id: str = "",
-    subcategory_id: str = "",
-    call_type_id: str = "",
-    impact_id: str = "",
-    urgency_id: str = "",
+    request_text: str = "",
+    brief_description: str = "",
+    status_id: str = "",
     priority_id: str = "",
     operator_id: str = "",
     operator_group_id: str = "",
-    status_id: str = "",
     confirmed: bool = False,
 ) -> dict[str, Any]:
-    """Patch selected fields on an incident by number after explicit confirmation."""
+    """Update common fields on an incident by number after confirmation."""
     number = number.strip()
     if not number:
         raise ValueError("number must not be empty")
     payload: dict[str, Any] = {}
+    if action_text.strip(): payload["action"] = action_text.strip()
+    if request_text.strip(): payload["request"] = request_text.strip()
     if brief_description.strip():
         if len(brief_description.strip()) > 80:
             raise ValueError("brief_description must be 80 characters or fewer")
         payload["briefDescription"] = brief_description.strip()
-    if request_text.strip(): payload["request"] = request_text.strip()
-    if action_text.strip(): payload["action"] = action_text.strip()
-    for field_name, reference_id in {
-        "category": category_id, "subcategory": subcategory_id, "callType": call_type_id,
-        "impact": impact_id, "urgency": urgency_id, "priority": priority_id,
-        "operator": operator_id, "operatorGroup": operator_group_id, "status": status_id,
-    }.items():
-        reference = optional_reference(reference_id)
-        if reference:
-            payload[field_name] = reference
-    if not payload:
-        raise ValueError("At least one update field must be provided")
-    if not confirmed:
-        return {"status": "confirmation_required", "operation": "update_incident_by_number", "incidentNumber": number, "proposedChanges": payload}
-    data = topdesk_write("PATCH", f"/incidents/number/{quote(number, safe='')}", payload, params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS})
-    return {"status": "updated", "incident": transform_incident(data)}
-
-
-@mcp.tool()
-def update_incident_by_id(
-    incident_id: str,
-    brief_description: str = "",
-    request_text: str = "",
-    action_text: str = "",
-    status_id: str = "",
-    priority_id: str = "",
-    operator_id: str = "",
-    operator_group_id: str = "",
-    confirmed: bool = False,
-) -> dict[str, Any]:
-    """Patch common fields on an incident UUID after explicit confirmation."""
-    incident_id = incident_id.strip()
-    if not incident_id:
-        raise ValueError("incident_id must not be empty")
-    payload: dict[str, Any] = {}
-    if brief_description.strip():
-        if len(brief_description.strip()) > 80:
-            raise ValueError("brief_description must be 80 characters or fewer")
-        payload["briefDescription"] = brief_description.strip()
-    if request_text.strip(): payload["request"] = request_text.strip()
-    if action_text.strip(): payload["action"] = action_text.strip()
     for field_name, reference_id in {
         "status": status_id, "priority": priority_id,
         "operator": operator_id, "operatorGroup": operator_group_id,
@@ -761,9 +731,119 @@ def update_incident_by_id(
     if not payload:
         raise ValueError("At least one update field must be provided")
     if not confirmed:
-        return {"status": "confirmation_required", "operation": "update_incident_by_id", "incidentId": incident_id, "proposedChanges": payload}
-    data = topdesk_write("PATCH", f"/incidents/id/{quote(incident_id, safe='')}", payload, params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS})
+        return {"status": "confirmation_required", "incidentNumber": number, "proposedChanges": payload}
+    data = topdesk_write("PATCH", f"/incidents/number/{quote(number, safe='')}", payload, params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS})
     return {"status": "updated", "incident": transform_incident(data)}
+
+
+@mcp.tool()
+def incident_wizard_start(
+    problem: str,
+    caller_query: str = "",
+    knowledge_limit: int = 3,
+    incident_limit: int = 3,
+) -> dict[str, Any]:
+    """Start Wizard V1 without writing data."""
+    problem = problem.strip()
+    if not problem:
+        return {"status": "needs_input", "step": "problem", "question": "Beskriv kort problemet."}
+    caller_candidates = (
+        find_callers(caller_query, 10)
+        if caller_query.strip()
+        else {"status": "needs_input", "question": "Gælder sagen dig selv eller en kollega?", "callers": []}
+    )
+    return {
+        "status": "wizard_started",
+        "step": "review_existing_help",
+        "problem": problem,
+        "knowledge": search_knowledge(problem, max(1, min(knowledge_limit, 5))),
+        "similarIncidents": search_incidents(problem, max(1, min(incident_limit, 5)), INCIDENT_SCAN_LIMIT),
+        "callerCandidates": caller_candidates,
+        "choices": {
+            "categories": compact_metadata(get_metadata_list("/incidents/categories")),
+            "callTypes": compact_metadata(get_metadata_list("/incidents/call_types")),
+            "impacts": compact_metadata(get_metadata_list("/incidents/impacts")),
+            "urgencies": compact_metadata(get_metadata_list("/incidents/urgencies")),
+            "priorities": compact_metadata(get_metadata_list("/incidents/priorities")),
+        },
+        "nextQuestion": "Vis relevant hjælp og spørg, om brugeren stadig vil oprette en sag.",
+    }
+
+
+@mcp.tool()
+def incident_wizard_preview(
+    brief_description: str,
+    caller_id: str,
+    request_text: str,
+    category_id: str = "",
+    subcategory_id: str = "",
+    call_type_id: str = "",
+    impact_id: str = "",
+    urgency_id: str = "",
+    priority_id: str = "",
+) -> dict[str, Any]:
+    """Validate the draft and return a non-writing final preview."""
+    missing = [name for name, value in {
+        "brief_description": brief_description,
+        "caller_id": caller_id,
+        "request_text": request_text,
+    }.items() if not value.strip()]
+    if missing:
+        return {"status": "needs_input", "missingFields": missing}
+    if len(brief_description.strip()) > 80:
+        return {"status": "needs_input", "message": "Titlen må højst indeholde 80 tegn."}
+    payload: dict[str, Any] = {
+        "briefDescription": brief_description.strip(),
+        "request": request_text.strip(),
+        "caller": {"id": caller_id.strip()},
+    }
+    for field_name, reference_id in {
+        "category": category_id, "subcategory": subcategory_id, "callType": call_type_id,
+        "impact": impact_id, "urgency": urgency_id, "priority": priority_id,
+    }.items():
+        reference = optional_reference(reference_id)
+        if reference:
+            payload[field_name] = reference
+    return {
+        "status": "confirmation_required",
+        "step": "confirm",
+        "caller": get_caller(caller_id.strip()),
+        "proposedIncident": payload,
+        "allowedAnswers": ["Ja, opret sagen", "Rediger", "Annuller"],
+    }
+
+
+@mcp.tool()
+def incident_wizard_submit(
+    brief_description: str,
+    caller_id: str,
+    request_text: str,
+    category_id: str = "",
+    subcategory_id: str = "",
+    call_type_id: str = "",
+    impact_id: str = "",
+    urgency_id: str = "",
+    priority_id: str = "",
+    confirmed: bool = False,
+) -> dict[str, Any]:
+    """Create the final Wizard draft after explicit confirmation."""
+    if not confirmed:
+        return {"status": "confirmation_required", "message": "Brugeren skal eksplicit bekræfte oprettelsen."}
+    result = create_incident(
+        brief_description=brief_description,
+        caller_id=caller_id,
+        request_text=request_text,
+        category_id=category_id,
+        subcategory_id=subcategory_id,
+        call_type_id=call_type_id,
+        impact_id=impact_id,
+        urgency_id=urgency_id,
+        priority_id=priority_id,
+        confirmed=True,
+    )
+    if result.get("status") == "created":
+        result["wizardStatus"] = "completed"
+    return result
 
 
 if __name__ == "__main__":
