@@ -344,7 +344,7 @@ def format_user_choices(
         item_name = str(item.get("name") or "").strip()
         choice = dict(item)
         choice["number"] = index
-        choice["display"] = f"{index}. {item_name} (ID: {item_id})"
+        choice["display"] = f"({index}) {item_name} (ID: {item_id})"
         choices.append(choice)
     return choices
 
@@ -730,7 +730,7 @@ def list_incident_categories() -> dict[str, Any]:
         "count": len(choices),
         "categories": choices,
         "question": "Vælg en kategori fra listen ved at angive nummer, navn eller ID.",
-        "displayFormat": "Nummer. Navn (ID: UUID)",
+        "displayFormat": "(Nummer) Navn (ID: UUID)",
     }
 
 
@@ -757,7 +757,7 @@ def list_incident_subcategories(
         "question": (
             "Vælg en underkategori fra listen ved at angive nummer, navn eller ID."
         ),
-        "displayFormat": "Nummer. Navn (ID: UUID)",
+        "displayFormat": "(Nummer) Navn (ID: UUID)",
     }
 
 
@@ -773,7 +773,7 @@ def list_operator_groups() -> dict[str, Any]:
         "question": (
             "Vælg en operatørgruppe fra listen ved at angive nummer, navn eller ID."
         ),
-        "displayFormat": "Nummer. Navn (ID: UUID)",
+        "displayFormat": "(Nummer) Navn (ID: UUID)",
     }
 
 
@@ -808,7 +808,7 @@ def find_operators(
         "question": (
             "Vælg en ansvarlig operatør fra listen ved at angive nummer, navn eller ID."
         ),
-        "displayFormat": "Nummer. Navn (ID: UUID)",
+        "displayFormat": "(Nummer) Navn (ID: UUID)",
         "note": (
             "TOPdesk validates that the selected operator belongs to the "
             "selected operator group when the incident is created."
@@ -1045,23 +1045,23 @@ def incident_wizard_start(
         },
         "selectionInstructions": {
             "category": (
-                "Vis alle kategorier som 'Nummer. Navn (ID: UUID)' og bed "
+                "Vis alle kategorier som '(Nummer) Navn (ID: UUID)' og bed "
                 "brugeren vælge en af de viste muligheder."
             ),
             "subcategory": (
                 "Når kategorien er valgt, kald "
                 "incident_wizard_get_subcategories med kategoriens ID, vis "
-                "alle underkategorier som 'Nummer. Navn (ID: UUID)', og bed "
+                "alle underkategorier som '(Nummer) Navn (ID: UUID)', og bed "
                 "brugeren vælge en af de viste muligheder."
             ),
             "operatorGroup": (
-                "Vis alle operatørgrupper som 'Nummer. Navn (ID: UUID)' og "
+                "Vis alle operatørgrupper som '(Nummer) Navn (ID: UUID)' og "
                 "bed brugeren vælge en af de viste muligheder."
             ),
             "operator": (
                 "Når operatørgruppen er valgt, kald "
                 "incident_wizard_get_assignment_choices med gruppens ID, vis "
-                "alle operatører som 'Nummer. Navn (ID: UUID)', og bed "
+                "alle operatører som '(Nummer) Navn (ID: UUID)', og bed "
                 "brugeren vælge en af de viste muligheder."
             ),
             "neverAskForUnknownId": (
@@ -1115,7 +1115,7 @@ def incident_wizard_get_assignment_choices(
                 "Vælg først en operatørgruppe fra listen. Angiv nummer, navn eller ID."
             ),
             "operatorGroups": groups,
-            "displayFormat": "Nummer. Navn (ID: UUID)",
+            "displayFormat": "(Nummer) Navn (ID: UUID)",
         }
 
     group = incident_get(
@@ -1135,7 +1135,7 @@ def incident_wizard_get_assignment_choices(
             "navn eller ID. TOPdesk validerer ved oprettelsen, at den "
             "ansvarlige tilhører den valgte gruppe."
         ),
-        "displayFormat": "Nummer. Navn (ID: UUID)",
+        "displayFormat": "(Nummer) Navn (ID: UUID)",
     }
 
 
