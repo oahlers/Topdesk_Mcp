@@ -741,6 +741,110 @@ def search_incidents(
 
 
 @mcp.tool()
+def find_incidents_by_requester(
+    requester_name: str,
+    title_contains: str = "",
+    status: str = "",
+    limit: int = 100,
+    scan: int = 1000,
+    exact_match: bool = True,
+) -> dict[str, Any]:
+    """Find incidents by requester/caller, optionally filtered by title and status.
+
+    In TOPdesk incident data, the requester shown in the TOPdesk interface is
+    represented by the incident's caller field. Use this tool for questions
+    such as: "Show incidents requested by Susanne Madsen" or "Show account
+    decommission incidents created by Susanne Madsen".
+    """
+    requester_name = re.sub(r"\s+", " ", requester_name).strip()
+    title_contains = re.sub(r"\s+", " ", title_contains).strip()
+    status = re.sub(r"\s+", " ", status).strip()
+
+    if not requester_name:
+        raise ValueError("requester_name must not be empty")
+
+    limit = max(1, min(limit, 500))
+    scan = max(1, min(scan, 5000))
+
+    requester_filter = requester_name.casefold()
+    title_filter = title_contains.casefold()
+    status_filter = status.casefold()
+
+    matches: list[dict[str, Any]] = []
+    scanned = 0
+    page_start = 0
+    page_size = min(100, scan)
+
+    while scanned < scan and len(matches) < limit:
+        current_page_size = min(page_size, scan - scanned)
+        data = incident_get(
+            "/incidents",
+            params={
+                "pageStart": page_start,
+                "pageSize": current_page_size,
+                "sort": "creationDate:desc",
+                "dateFormat": "iso8601",
+                "fields": INCIDENT_FIELDS,
+            },
+        )
+        raw_incidents = extract_list(data)
+        if not raw_incidents:
+            break
+
+        for raw in raw_incidents:
+            item = transform_incident(raw)
+            scanned += 1
+
+            caller_name = re.sub(
+                r"\s+", " ", item.get("caller", "")
+            ).strip()
+            caller_value = caller_name.casefold()
+
+            requester_matches = (
+                caller_value == requester_filter
+                if exact_match
+                else requester_filter in caller_value
+            )
+            if not requester_matches:
+                continue
+
+            if title_filter not in item.get("briefDescription", "").casefold():
+                continue
+
+            if status_filter and status_filter not in item.get("status", "").casefold():
+                continue
+
+            item["requester"] = caller_name
+            item["matchedOn"] = "caller"
+            matches.append(item)
+            if len(matches) >= limit:
+                break
+
+        if len(raw_incidents) < current_page_size:
+            break
+
+        page_start += len(raw_incidents)
+
+    return {
+        "status": "ok",
+        "requesterName": requester_name,
+        "titleContains": title_contains,
+        "statusFilter": status,
+        "exactMatch": exact_match,
+        "scannedCount": scanned,
+        "count": len(matches),
+        "limitReached": len(matches) >= limit,
+        "scanLimitReached": scanned >= scan,
+        "incidents": matches,
+        "note": (
+            "Requester is matched against TOPdesk's caller field. "
+            "The result identifies the requester, not necessarily the operator "
+            "who processed or closed the incident."
+        ),
+    }
+
+
+@mcp.tool()
 def get_incident_by_id(incident_id: str) -> dict[str, Any]:
     """Get an incident by UUID."""
     incident_id = incident_id.strip()
