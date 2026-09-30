@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import os
 import re
-from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -536,19 +535,6 @@ def build_second_line_payload(
     return payload
 
 
-def format_incident_datetime(value: Any) -> str:
-    """Format a TOPdesk timestamp as a full Danish-style date and time."""
-    text = str(value or "").strip()
-    if not text:
-        return ""
-
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        return parsed.strftime("%d-%m-%Y %H:%M")
-    except ValueError:
-        return text
-
-
 def extract_match_context(text: str, needle: str, context: int = 140) -> str:
     """Return a short excerpt around a case-insensitive text match."""
     cleaned = clean_html(text)
@@ -678,17 +664,15 @@ def get_knowledge_item(identifier: str) -> dict[str, Any]:
 def list_recent_incidents(
     limit: int = 10,
     start: int = 0,
-    status: str = "secondLine",
 ) -> dict[str, Any]:
-    """List recent incidents in a fixed service-desk table format.
+    """List recent accessible incidents in a fixed service-desk table format.
 
-    The tool defaults to secondLine incidents. Status is used internally for
-    filtering, but is deliberately omitted from the returned table rows.
+    Includes both firstLine and secondLine incidents. Status is not returned as
+    a display column.
     """
     limit = max(1, min(limit, 100))
     page_start = max(0, start)
     page_size = min(100, max(limit, 25))
-    status_filter = status.strip().casefold() or "secondline"
     incidents: list[dict[str, Any]] = []
 
     while len(incidents) < limit:
@@ -708,8 +692,6 @@ def list_recent_incidents(
 
         for raw in raw_incidents:
             incident = transform_incident(raw)
-            if status_filter not in incident.get("status", "").casefold():
-                continue
 
             # The list endpoint can omit assignment details. Fetch the full
             # incident only when operator or operator group is missing.
@@ -733,7 +715,6 @@ def list_recent_incidents(
                     if isinstance(detail_raw, dict) and detail_raw:
                         incident = transform_incident(detail_raw)
                 except TopdeskApiError:
-                    # Keep the list result if the detail lookup is unavailable.
                     pass
 
             incidents.append(
@@ -757,7 +738,6 @@ def list_recent_incidents(
 
     return {
         "count": len(incidents),
-        "filteredStatus": status or "secondLine",
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
@@ -768,7 +748,7 @@ def list_recent_incidents(
         ],
         "presentationInstruction": (
             "Vis kun displayColumns i den angivne rækkefølge. "
-            "Vis ikke filteredStatus som en tabelkolonne."
+            "Vis ikke status eller andre felter i tabellen."
         ),
         "incidents": incidents,
     }
