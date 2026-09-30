@@ -652,7 +652,7 @@ def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
 
 
 def build_incident_indexes(incidents: list[dict[str, Any]]) -> None:
-    """Build requester, operator, category, subcategory and number indexes."""
+    """Build in-memory indexes for fast requester and metadata searches."""
     global _REQUESTER_INDEX
     global _OPERATOR_INDEX
     global _CATEGORY_INDEX
@@ -669,9 +669,9 @@ def build_incident_indexes(incidents: list[dict[str, Any]]) -> None:
         incident = transform_incident(raw)
         requester = extract_requester_name(incident.get("request", "")).casefold()
         caller = caller_display_name(raw.get("caller")).casefold()
-        operator = incident.get("operator", "").strip().casefold()
-        category = incident.get("category", "").strip().casefold()
-        subcategory = incident.get("subcategory", "").strip().casefold()
+        operator = incident.get("operator", "").casefold()
+        category = incident.get("category", "").casefold()
+        subcategory = incident.get("subcategory", "").casefold()
         number = normalize_incident_number(incident.get("number", "")).casefold()
 
         for person_key in {requester, caller}:
@@ -691,31 +691,6 @@ def build_incident_indexes(incidents: list[dict[str, Any]]) -> None:
     _CATEGORY_INDEX = category_index
     _SUBCATEGORY_INDEX = subcategory_index
     _INCIDENT_NUMBER_INDEX = number_index
-
-
-def enrich_incident_index_data(incidents: list[dict[str, Any]]) -> None:
-    """Enrich cached rows missing assignment/classification data.
-
-    TOPdesk list responses can omit operator and classification fields even
-    though the incident detail endpoint contains them. Only missing rows are
-    opened, and the enriched detail replaces the cached row in place.
-    """
-    for index, raw in enumerate(incidents):
-        incident = transform_incident(raw)
-        if incident.get("operator") and incident.get("category") and incident.get("subcategory"):
-            continue
-        incident_id = incident.get("id", "").strip()
-        if not incident_id:
-            continue
-        try:
-            detail = incident_get(
-                f"/incidents/id/{quote(incident_id, safe='')}",
-                params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS},
-            )
-        except TopdeskApiError:
-            continue
-        if isinstance(detail, dict) and detail:
-            incidents[index] = detail
 
 
 def clear_incident_cache() -> None:
@@ -776,9 +751,6 @@ def get_all_incidents_cached(
 
     _INCIDENT_CACHE = incidents
     build_incident_indexes(_INCIDENT_CACHE)
-    if not _OPERATOR_INDEX or not _CATEGORY_INDEX or not _SUBCATEGORY_INDEX:
-        enrich_incident_index_data(_INCIDENT_CACHE)
-        build_incident_indexes(_INCIDENT_CACHE)
     _INCIDENT_CACHE_LOADED_AT = time.monotonic()
     return _INCIDENT_CACHE, False, 0
 
@@ -1304,50 +1276,101 @@ def find_incidents_created_by_person(
     }
 
 
-def paged_incident_table_response(
+def find_reference_ids(
+    path: str,
+    name: str,
+    page_size: int = 1000,
+) -> list[dict[str, str]]:
+    """Resolve matching TOPdesk metadata names to IDs."""
+    target = re.sub(r"\s+", " ", name).strip().casefold()
+    matches: list[dict[str, str]] = []
+    page_start = 0
+    while target:
+        data = incident_get(path, params={"pageStart": page_start, "pageSize": page_size})
+        page = extract_list(data)
+        if not page:
+            break
+        for item in page:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or item.get("value") or "").strip()
+            item_name = scalar(item).strip()
+            if item_id and item_name.casefold().startswith(target):
+                matches.append({"id": item_id, "name": item_name})
+        if len(page) < page_size:
+            break
+        page_start += len(page)
+    return matches
+
+
+def query_incidents_by_reference(
+    field_name: str,
+    references: list[dict[str, str]],
+    title_contains: str = "",
+    max_results: int = 10000,
+) -> list[dict[str, Any]]:
+    """Use TOPdesk FIQL filtering instead of opening every incident detail."""
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for reference in references:
+        page_start = 0
+        page_size = min(1000, max_results)
+        while len(results) < max_results:
+            data = incident_get(
+                "/incidents",
+                params={
+                    "pageStart": page_start,
+                    "pageSize": min(page_size, max_results - len(results)),
+                    "sort": "creationDate:desc",
+                    "dateFormat": "iso8601",
+                    "all": "true",
+                    "query": f"{field_name}.id=={fiql_escape(reference['id'])}",
+                    "fields": INCIDENT_FIELDS,
+                },
+            )
+            page = extract_list(data)
+            if not page:
+                break
+            for raw in page:
+                incident = transform_incident(raw)
+                if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
+                    continue
+                identity = incident.get("number") or incident.get("id")
+                if identity and identity not in seen:
+                    seen.add(identity)
+                    results.append(raw)
+            if len(page) < page_size:
+                break
+            page_start += len(page)
+    return results
+
+
+def indexed_table_response(
     raw_matches: list[dict[str, Any]],
     limit: int,
     offset: int,
-    cache_hit: bool,
-    cache_age_seconds: int,
     index_used: str,
     index_key: str,
-    cached_count: int,
+    references: list[dict[str, str]],
 ) -> dict[str, Any]:
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
-    total_matches = len(raw_matches)
-    page_raw = raw_matches[offset:offset + limit]
-    page = [incident_result_row(raw) for raw in page_raw]
+    total = len(raw_matches)
+    page = [incident_result_row(raw) for raw in raw_matches[offset:offset + limit]]
     next_offset = offset + len(page)
-    has_more = next_offset < total_matches
     return {
         "count": len(page),
-        "totalMatches": total_matches,
+        "totalMatches": total,
         "offset": offset,
         "limit": limit,
-        "hasMore": has_more,
-        "nextOffset": next_offset if has_more else None,
-        "scannedCount": len(raw_matches),
-        "cachedIncidentCount": cached_count,
+        "hasMore": next_offset < total,
+        "nextOffset": next_offset if next_offset < total else None,
         "indexUsed": index_used,
         "indexKey": index_key,
-        "cacheHit": cache_hit,
-        "cacheAgeSeconds": cache_age_seconds,
-        "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
+        "matchedReferences": references,
         "resultType": "table",
-        "displayColumns": [
-            "Sagsnummer",
-            "Beskrivelse",
-            "Status",
-            "Dato tilføjet (oprettet)",
-            "Rekvirentnavn",
-            "Anmoder",
-        ],
-        "presentationInstruction": (
-            "Vis altid tableData som en Markdown-tabel med displayColumns i den "
-            "angivne rækkefølge. Vis aldrig firstLine eller secondLine."
-        ),
+        "displayColumns": ["Sagsnummer", "Beskrivelse", "Status", "Dato tilføjet (oprettet)", "Rekvirentnavn", "Anmoder"],
+        "presentationInstruction": "Vis altid tableData som en Markdown-tabel med displayColumns i den angivne rækkefølge.",
         "tableData": page,
         "incidents": page,
     }
@@ -1359,31 +1382,12 @@ def find_incidents_by_operator(
     title_contains: str = "",
     limit: int = 50,
     offset: int = 0,
-    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Find incidents assigned to a responsible TOPdesk operator."""
+    """Find incidents assigned to an operator using TOPdesk server-side filtering."""
     operator_name = re.sub(r"\s+", " ", operator_name).strip()
-    if not operator_name:
-        raise ValueError("operator_name must not be empty")
-    all_incidents, cache_hit, cache_age = get_all_incidents_cached(refresh=refresh)
-    needle = operator_name.casefold()
-    matching_keys = [key for key in _OPERATOR_INDEX if key.startswith(needle)]
-    raw_matches = []
-    seen = set()
-    for key in matching_keys:
-        for raw in _OPERATOR_INDEX[key]:
-            number = str(raw.get("number") or raw.get("id") or "")
-            if number in seen:
-                continue
-            incident = transform_incident(raw)
-            if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
-                continue
-            seen.add(number)
-            raw_matches.append(raw)
-    return paged_incident_table_response(
-        raw_matches, limit, offset, cache_hit, cache_age,
-        "operator", operator_name.casefold(), len(all_incidents),
-    )
+    references = find_reference_ids("/incidents/operators/lookup", operator_name)
+    matches = query_incidents_by_reference("operator", references, title_contains)
+    return indexed_table_response(matches, limit, offset, "topdesk-fiql-operator", operator_name.casefold(), references)
 
 
 @mcp.tool()
@@ -1392,31 +1396,12 @@ def find_incidents_by_category(
     title_contains: str = "",
     limit: int = 50,
     offset: int = 0,
-    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Find incidents in a TOPdesk category."""
+    """Find incidents in a category using TOPdesk server-side filtering."""
     category_name = re.sub(r"\s+", " ", category_name).strip()
-    if not category_name:
-        raise ValueError("category_name must not be empty")
-    all_incidents, cache_hit, cache_age = get_all_incidents_cached(refresh=refresh)
-    needle = category_name.casefold()
-    matching_keys = [key for key in _CATEGORY_INDEX if key.startswith(needle)]
-    raw_matches = []
-    seen = set()
-    for key in matching_keys:
-        for raw in _CATEGORY_INDEX[key]:
-            number = str(raw.get("number") or raw.get("id") or "")
-            if number in seen:
-                continue
-            incident = transform_incident(raw)
-            if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
-                continue
-            seen.add(number)
-            raw_matches.append(raw)
-    return paged_incident_table_response(
-        raw_matches, limit, offset, cache_hit, cache_age,
-        "category", category_name.casefold(), len(all_incidents),
-    )
+    references = find_reference_ids("/incidents/categories", category_name)
+    matches = query_incidents_by_reference("category", references, title_contains)
+    return indexed_table_response(matches, limit, offset, "topdesk-fiql-category", category_name.casefold(), references)
 
 
 @mcp.tool()
@@ -1425,31 +1410,12 @@ def find_incidents_by_subcategory(
     title_contains: str = "",
     limit: int = 50,
     offset: int = 0,
-    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Find incidents in a TOPdesk subcategory."""
+    """Find incidents in a subcategory using TOPdesk server-side filtering."""
     subcategory_name = re.sub(r"\s+", " ", subcategory_name).strip()
-    if not subcategory_name:
-        raise ValueError("subcategory_name must not be empty")
-    all_incidents, cache_hit, cache_age = get_all_incidents_cached(refresh=refresh)
-    needle = subcategory_name.casefold()
-    matching_keys = [key for key in _SUBCATEGORY_INDEX if key.startswith(needle)]
-    raw_matches = []
-    seen = set()
-    for key in matching_keys:
-        for raw in _SUBCATEGORY_INDEX[key]:
-            number = str(raw.get("number") or raw.get("id") or "")
-            if number in seen:
-                continue
-            incident = transform_incident(raw)
-            if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
-                continue
-            seen.add(number)
-            raw_matches.append(raw)
-    return paged_incident_table_response(
-        raw_matches, limit, offset, cache_hit, cache_age,
-        "subcategory", subcategory_name.casefold(), len(all_incidents),
-    )
+    references = find_reference_ids("/incidents/subcategories", subcategory_name)
+    matches = query_incidents_by_reference("subcategory", references, title_contains)
+    return indexed_table_response(matches, limit, offset, "topdesk-fiql-subcategory", subcategory_name.casefold(), references)
 
 
 @mcp.tool()
