@@ -638,50 +638,6 @@ def caller_display_name(raw_caller: Any) -> str:
     return "" if is_uuid(value) else value
 
 
-def normalize_business_status(value: Any) -> str:
-    """Return the TOPdesk processing status as an approved Danish label.
-
-    Incident-line values such as firstLine and secondLine are deliberately not
-    exposed as user-facing status values.
-    """
-    text = scalar(value).strip()
-    key = re.sub(r"[\s_-]+", " ", text).strip().casefold()
-
-    mapping = {
-        "registered": "Registreret",
-        "registreret": "Registreret",
-        "assigned": "Tildelt",
-        "tildelt": "Tildelt",
-        "in progress": "Igang",
-        "in progress ": "Igang",
-        "igang": "Igang",
-        "i gang": "Igang",
-        "waiting for user": "Venter på bruger",
-        "waiting for customer": "Venter på bruger",
-        "venter på bruger": "Venter på bruger",
-        "waiting for supplier": "Venter på leverandør",
-        "waiting for vendor": "Venter på leverandør",
-        "venter på leverandør": "Venter på leverandør",
-        "completed": "Udført",
-        "done": "Udført",
-        "udført": "Udført",
-        "closed": "Lukket",
-        "lukket": "Lukket",
-        "updated by user": "Opdateret af bruger",
-        "updated by customer": "Opdateret af bruger",
-        "opdateret af bruger": "Opdateret af bruger",
-        "updated by supplier": "Opdateret af leverandør",
-        "updated by vendor": "Opdateret af leverandør",
-        "opdateret af leverandør": "Opdateret af leverandør",
-    }
-
-    # Never expose incident-line values as processing status.
-    if key in {"firstline", "first line", "secondline", "second line"}:
-        return "Ikke angivet"
-
-    return mapping.get(key, text or "Ikke angivet")
-
-
 def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
     incident = transform_incident(raw)
     requester = extract_requester_name(incident.get("request", ""))
@@ -689,7 +645,6 @@ def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
     return {
         "Sagsnummer": incident.get("number", ""),
         "Beskrivelse": incident.get("briefDescription", ""),
-        "Status": normalize_business_status(raw.get("processingStatus")),
         "Dato tilføjet (oprettet)": format_incident_datetime(incident.get("creationDate", "")),
         "Rekvirentnavn": requester or caller or "Ikke angivet",
         "Anmoder": caller or requester or "Ikke angivet",
@@ -697,7 +652,7 @@ def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
 
 
 def build_incident_indexes(incidents: list[dict[str, Any]]) -> None:
-    """Build in-memory indexes for fast requester and metadata searches."""
+    """Build requester, operator, category, subcategory and number indexes."""
     global _REQUESTER_INDEX
     global _OPERATOR_INDEX
     global _CATEGORY_INDEX
@@ -714,9 +669,9 @@ def build_incident_indexes(incidents: list[dict[str, Any]]) -> None:
         incident = transform_incident(raw)
         requester = extract_requester_name(incident.get("request", "")).casefold()
         caller = caller_display_name(raw.get("caller")).casefold()
-        operator = incident.get("operator", "").casefold()
-        category = incident.get("category", "").casefold()
-        subcategory = incident.get("subcategory", "").casefold()
+        operator = incident.get("operator", "").strip().casefold()
+        category = incident.get("category", "").strip().casefold()
+        subcategory = incident.get("subcategory", "").strip().casefold()
         number = normalize_incident_number(incident.get("number", "")).casefold()
 
         for person_key in {requester, caller}:
@@ -736,6 +691,31 @@ def build_incident_indexes(incidents: list[dict[str, Any]]) -> None:
     _CATEGORY_INDEX = category_index
     _SUBCATEGORY_INDEX = subcategory_index
     _INCIDENT_NUMBER_INDEX = number_index
+
+
+def enrich_incident_index_data(incidents: list[dict[str, Any]]) -> None:
+    """Enrich cached rows missing assignment/classification data.
+
+    TOPdesk list responses can omit operator and classification fields even
+    though the incident detail endpoint contains them. Only missing rows are
+    opened, and the enriched detail replaces the cached row in place.
+    """
+    for index, raw in enumerate(incidents):
+        incident = transform_incident(raw)
+        if incident.get("operator") and incident.get("category") and incident.get("subcategory"):
+            continue
+        incident_id = incident.get("id", "").strip()
+        if not incident_id:
+            continue
+        try:
+            detail = incident_get(
+                f"/incidents/id/{quote(incident_id, safe='')}",
+                params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS},
+            )
+        except TopdeskApiError:
+            continue
+        if isinstance(detail, dict) and detail:
+            incidents[index] = detail
 
 
 def clear_incident_cache() -> None:
@@ -796,6 +776,9 @@ def get_all_incidents_cached(
 
     _INCIDENT_CACHE = incidents
     build_incident_indexes(_INCIDENT_CACHE)
+    if not _OPERATOR_INDEX or not _CATEGORY_INDEX or not _SUBCATEGORY_INDEX:
+        enrich_incident_index_data(_INCIDENT_CACHE)
+        build_incident_indexes(_INCIDENT_CACHE)
     _INCIDENT_CACHE_LOADED_AT = time.monotonic()
     return _INCIDENT_CACHE, False, 0
 
@@ -986,9 +969,6 @@ def list_recent_incidents(
                 {
                     "Sagsnummer": incident.get("number", ""),
                     "Beskrivelse": incident.get("briefDescription", ""),
-                    "Status": normalize_business_status(
-                        incident.get("processingStatus", "")
-                    ),
                     "Anmoder": incident.get("caller", "") or "Ikke angivet",
                     "Ansvarlig": incident.get("operator", "") or "Ikke tildelt",
                     "Gruppe": incident.get("operatorGroup", "") or "Ikke tildelt",
@@ -1009,7 +989,6 @@ def list_recent_incidents(
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
-            "Status",
             "Anmoder",
             "Ansvarlig",
             "Gruppe",
@@ -1017,7 +996,7 @@ def list_recent_incidents(
         ],
         "presentationInstruction": (
             "Vis kun displayColumns i den angivne rækkefølge. "
-            "Vis Status-kolonnen, men vis aldrig firstLine eller secondLine."
+            "Vis ikke status eller andre felter i tabellen."
         ),
         "incidents": incidents,
     }
@@ -1120,16 +1099,14 @@ def search_incidents_by_filters(
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
-            "Status",
             "Dato tilføjet (oprettet)",
             "Rekvirentnavn",
             "Anmoder",
         ],
         "presentationInstruction": (
             "Vis altid tableData som en Markdown-tabel. Brug præcis kolonnerne "
-            "i displayColumns og i den angivne rækkefølge. Status skal komme fra "
-            "processingStatus. Vis aldrig firstLine eller secondLine, og vis "
-            "ikke lukket dato eller andre incidentfelter."
+            "i displayColumns og i den angivne rækkefølge. Vis ikke status, "
+            "lukket dato eller andre incidentfelter."
         ),
         "tableData": page,
         "incidents": page,
@@ -1238,7 +1215,7 @@ def find_incidents_by_requester(
         if len(rows)>=limit: break
     return {
         "count":len(rows),"requesterName":requester_name,"callerCandidates":candidates,
-        "displayColumns":["Sagsnummer","Beskrivelse","Status","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
+        "displayColumns":["Sagsnummer","Beskrivelse","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
         "incidents":rows,
     }
 
@@ -1312,21 +1289,167 @@ def find_incidents_created_by_person(
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
-            "Status",
             "Dato tilføjet (oprettet)",
             "Rekvirentnavn",
             "Anmoder",
         ],
         "presentationInstruction": (
             "Vis altid tableData som en Markdown-tabel. Brug præcis kolonnerne "
-            "i displayColumns og i den angivne rækkefølge. Status skal komme fra "
-            "processingStatus. Vis aldrig firstLine eller secondLine, og vis "
-            "ikke lukket dato eller andre incidentfelter. Hvis hasMore er true, "
+            "i displayColumns og i den angivne rækkefølge. Vis ikke status, "
+            "lukket dato eller andre incidentfelter. Hvis hasMore er true, "
             "oplys efter tabellen at flere resultater kan hentes med nextOffset."
         ),
         "tableData": page,
         "incidents": page,
     }
+
+
+def paged_incident_table_response(
+    raw_matches: list[dict[str, Any]],
+    limit: int,
+    offset: int,
+    cache_hit: bool,
+    cache_age_seconds: int,
+    index_used: str,
+    index_key: str,
+    cached_count: int,
+) -> dict[str, Any]:
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    total_matches = len(raw_matches)
+    page_raw = raw_matches[offset:offset + limit]
+    page = [incident_result_row(raw) for raw in page_raw]
+    next_offset = offset + len(page)
+    has_more = next_offset < total_matches
+    return {
+        "count": len(page),
+        "totalMatches": total_matches,
+        "offset": offset,
+        "limit": limit,
+        "hasMore": has_more,
+        "nextOffset": next_offset if has_more else None,
+        "scannedCount": len(raw_matches),
+        "cachedIncidentCount": cached_count,
+        "indexUsed": index_used,
+        "indexKey": index_key,
+        "cacheHit": cache_hit,
+        "cacheAgeSeconds": cache_age_seconds,
+        "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
+        "resultType": "table",
+        "displayColumns": [
+            "Sagsnummer",
+            "Beskrivelse",
+            "Status",
+            "Dato tilføjet (oprettet)",
+            "Rekvirentnavn",
+            "Anmoder",
+        ],
+        "presentationInstruction": (
+            "Vis altid tableData som en Markdown-tabel med displayColumns i den "
+            "angivne rækkefølge. Vis aldrig firstLine eller secondLine."
+        ),
+        "tableData": page,
+        "incidents": page,
+    }
+
+
+@mcp.tool()
+def find_incidents_by_operator(
+    operator_name: str,
+    title_contains: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Find incidents assigned to a responsible TOPdesk operator."""
+    operator_name = re.sub(r"\s+", " ", operator_name).strip()
+    if not operator_name:
+        raise ValueError("operator_name must not be empty")
+    all_incidents, cache_hit, cache_age = get_all_incidents_cached(refresh=refresh)
+    needle = operator_name.casefold()
+    matching_keys = [key for key in _OPERATOR_INDEX if key.startswith(needle)]
+    raw_matches = []
+    seen = set()
+    for key in matching_keys:
+        for raw in _OPERATOR_INDEX[key]:
+            number = str(raw.get("number") or raw.get("id") or "")
+            if number in seen:
+                continue
+            incident = transform_incident(raw)
+            if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
+                continue
+            seen.add(number)
+            raw_matches.append(raw)
+    return paged_incident_table_response(
+        raw_matches, limit, offset, cache_hit, cache_age,
+        "operator", operator_name.casefold(), len(all_incidents),
+    )
+
+
+@mcp.tool()
+def find_incidents_by_category(
+    category_name: str,
+    title_contains: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Find incidents in a TOPdesk category."""
+    category_name = re.sub(r"\s+", " ", category_name).strip()
+    if not category_name:
+        raise ValueError("category_name must not be empty")
+    all_incidents, cache_hit, cache_age = get_all_incidents_cached(refresh=refresh)
+    needle = category_name.casefold()
+    matching_keys = [key for key in _CATEGORY_INDEX if key.startswith(needle)]
+    raw_matches = []
+    seen = set()
+    for key in matching_keys:
+        for raw in _CATEGORY_INDEX[key]:
+            number = str(raw.get("number") or raw.get("id") or "")
+            if number in seen:
+                continue
+            incident = transform_incident(raw)
+            if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
+                continue
+            seen.add(number)
+            raw_matches.append(raw)
+    return paged_incident_table_response(
+        raw_matches, limit, offset, cache_hit, cache_age,
+        "category", category_name.casefold(), len(all_incidents),
+    )
+
+
+@mcp.tool()
+def find_incidents_by_subcategory(
+    subcategory_name: str,
+    title_contains: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Find incidents in a TOPdesk subcategory."""
+    subcategory_name = re.sub(r"\s+", " ", subcategory_name).strip()
+    if not subcategory_name:
+        raise ValueError("subcategory_name must not be empty")
+    all_incidents, cache_hit, cache_age = get_all_incidents_cached(refresh=refresh)
+    needle = subcategory_name.casefold()
+    matching_keys = [key for key in _SUBCATEGORY_INDEX if key.startswith(needle)]
+    raw_matches = []
+    seen = set()
+    for key in matching_keys:
+        for raw in _SUBCATEGORY_INDEX[key]:
+            number = str(raw.get("number") or raw.get("id") or "")
+            if number in seen:
+                continue
+            incident = transform_incident(raw)
+            if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
+                continue
+            seen.add(number)
+            raw_matches.append(raw)
+    return paged_incident_table_response(
+        raw_matches, limit, offset, cache_hit, cache_age,
+        "subcategory", subcategory_name.casefold(), len(all_incidents),
+    )
 
 
 @mcp.tool()
