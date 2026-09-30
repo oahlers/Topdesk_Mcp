@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 from mcp.server import MCPServer
 
@@ -32,6 +33,23 @@ INCIDENT_CACHE_TTL_SECONDS = int(
 INCIDENT_CACHE_PAGE_SIZE = int(
     os.getenv("INCIDENT_CACHE_PAGE_SIZE", "2000")
 )
+LOOKUP_CACHE_TTL_SECONDS = int(
+    os.getenv("LOOKUP_CACHE_TTL_SECONDS", "3600")
+)
+HTTP_POOL_CONNECTIONS = int(os.getenv("HTTP_POOL_CONNECTIONS", "10"))
+HTTP_POOL_MAXSIZE = int(os.getenv("HTTP_POOL_MAXSIZE", "20"))
+
+HTTP_SESSION = requests.Session()
+HTTP_ADAPTER = HTTPAdapter(
+    pool_connections=max(1, HTTP_POOL_CONNECTIONS),
+    pool_maxsize=max(1, HTTP_POOL_MAXSIZE),
+    pool_block=True,
+)
+HTTP_SESSION.mount("https://", HTTP_ADAPTER)
+HTTP_SESSION.mount("http://", HTTP_ADAPTER)
+
+_LOOKUP_CACHE: dict[str, list[dict[str, Any]]] = {}
+_LOOKUP_CACHE_LOADED_AT: dict[str, float] = {}
 _INCIDENT_CACHE: list[dict[str, Any]] = []
 _INCIDENT_CACHE_LOADED_AT = 0.0
 _REQUESTER_INDEX: dict[str, list[dict[str, Any]]] = {}
@@ -162,7 +180,7 @@ def topdesk_request(
             "Set WRITE_OPERATIONS_ENABLED=true."
         )
 
-    response = requests.request(
+    response = HTTP_SESSION.request(
         method=method.upper(),
         url=f"{base_url}{path}",
         params=params,
@@ -368,8 +386,44 @@ def compact_metadata(
     return compact
 
 
+def clear_lookup_cache(cache_key: str = "") -> None:
+    """Clear one lookup cache entry or all lookup cache entries."""
+    if cache_key:
+        _LOOKUP_CACHE.pop(cache_key, None)
+        _LOOKUP_CACHE_LOADED_AT.pop(cache_key, None)
+        return
+    _LOOKUP_CACHE.clear()
+    _LOOKUP_CACHE_LOADED_AT.clear()
+
+
+def get_cached_lookup(
+    cache_key: str,
+    path: str,
+    params: dict[str, Any] | None = None,
+    refresh: bool = False,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """Return a TOPdesk lookup list from a TTL-controlled memory cache."""
+    now = time.monotonic()
+    loaded_at = _LOOKUP_CACHE_LOADED_AT.get(cache_key, 0.0)
+    age = now - loaded_at
+    cache_valid = (
+        cache_key in _LOOKUP_CACHE
+        and LOOKUP_CACHE_TTL_SECONDS > 0
+        and age < LOOKUP_CACHE_TTL_SECONDS
+    )
+    if cache_valid and not refresh:
+        return _LOOKUP_CACHE[cache_key], True, int(age)
+
+    items = extract_list(incident_get(path, params=params))
+    _LOOKUP_CACHE[cache_key] = items
+    _LOOKUP_CACHE_LOADED_AT[cache_key] = time.monotonic()
+    return items, False, 0
+
+
 def get_metadata(path: str) -> list[dict[str, Any]]:
-    return compact_metadata(extract_list(incident_get(path)))
+    cache_key = f"metadata:{path}"
+    items, _, _ = get_cached_lookup(cache_key, path)
+    return compact_metadata(items)
 
 
 def is_masked_operator_name(value: Any) -> bool:
@@ -820,6 +874,10 @@ def health() -> dict[str, Any]:
         "categoryIndexKeys": len(_CATEGORY_INDEX),
         "subcategoryIndexKeys": len(_SUBCATEGORY_INDEX),
         "incidentNumberIndexKeys": len(_INCIDENT_NUMBER_INDEX),
+        "lookupCacheTtlSeconds": LOOKUP_CACHE_TTL_SECONDS,
+        "lookupCacheEntries": len(_LOOKUP_CACHE),
+        "httpPoolConnections": HTTP_POOL_CONNECTIONS,
+        "httpPoolMaxSize": HTTP_POOL_MAXSIZE,
     }
 
 
@@ -1324,25 +1382,26 @@ def find_reference_ids(
     name: str,
     page_size: int = 1000,
 ) -> list[dict[str, str]]:
-    """Resolve matching TOPdesk metadata names to IDs."""
+    """Resolve matching TOPdesk metadata names to IDs using lookup cache."""
     target = re.sub(r"\s+", " ", name).strip().casefold()
+    if not target:
+        return []
+
+    cache_key = f"reference:{path}:page_size={page_size}"
+    items, _, _ = get_cached_lookup(
+        cache_key,
+        path,
+        params={"pageStart": 0, "pageSize": page_size},
+    )
+
     matches: list[dict[str, str]] = []
-    page_start = 0
-    while target:
-        data = incident_get(path, params={"pageStart": page_start, "pageSize": page_size})
-        page = extract_list(data)
-        if not page:
-            break
-        for item in page:
-            if not isinstance(item, dict):
-                continue
-            item_id = str(item.get("id") or item.get("value") or "").strip()
-            item_name = scalar(item).strip()
-            if item_id and item_name.casefold().startswith(target):
-                matches.append({"id": item_id, "name": item_name})
-        if len(page) < page_size:
-            break
-        page_start += len(page)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or item.get("value") or "").strip()
+        item_name = scalar(item).strip()
+        if item_id and item_name.casefold().startswith(target):
+            matches.append({"id": item_id, "name": item_name})
     return matches
 
 
@@ -1613,11 +1672,10 @@ def find_callers(
     """Find caller candidates for the incident wizard."""
     query = query.strip().lower()
     limit = max(1, min(limit, 100))
-    callers = extract_list(
-        incident_get(
-            "/incidents/callers/lookup",
-            params={"pageStart": 0, "pageSize": 1000},
-        )
+    callers, _, _ = get_cached_lookup(
+        "callers:page_size=1000",
+        "/incidents/callers/lookup",
+        params={"pageStart": 0, "pageSize": 1000},
     )
     selected = []
     for caller in callers:
@@ -1713,11 +1771,10 @@ def find_operators(
     """Find responsible operators while preserving their real TOPdesk names."""
     query = query.strip().lower()
     limit = max(1, min(limit, 100))
-    operators = extract_list(
-        incident_get(
-            "/incidents/operators/lookup",
-            params={"pageStart": 0, "pageSize": 1000},
-        )
+    operators, _, _ = get_cached_lookup(
+        "operators:page_size=1000",
+        "/incidents/operators/lookup",
+        params={"pageStart": 0, "pageSize": 1000},
     )
 
     resolved_operators = []
