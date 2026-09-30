@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -25,6 +26,14 @@ TOPDESK_HOST = os.getenv(
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 KNOWLEDGE_PAGE_SIZE = int(os.getenv("KNOWLEDGE_PAGE_SIZE", "100"))
 INCIDENT_SCAN_LIMIT = int(os.getenv("INCIDENT_SCAN_LIMIT", "250"))
+INCIDENT_CACHE_TTL_SECONDS = int(
+    os.getenv("INCIDENT_CACHE_TTL_SECONDS", "600")
+)
+INCIDENT_CACHE_PAGE_SIZE = int(
+    os.getenv("INCIDENT_CACHE_PAGE_SIZE", "2000")
+)
+_INCIDENT_CACHE: list[dict[str, Any]] = []
+_INCIDENT_CACHE_LOADED_AT = 0.0
 WRITE_OPERATIONS_ENABLED = os.getenv(
     "WRITE_OPERATIONS_ENABLED",
     "false",
@@ -637,10 +646,33 @@ def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def iter_all_incidents(page_size: int = 2000):
-    """Yield current, partial and archived incidents until TOPdesk is exhausted."""
+def clear_incident_cache() -> None:
+    """Clear the in-memory incident cache."""
+    global _INCIDENT_CACHE, _INCIDENT_CACHE_LOADED_AT
+    _INCIDENT_CACHE = []
+    _INCIDENT_CACHE_LOADED_AT = 0.0
+
+
+def get_all_incidents_cached(
+    refresh: bool = False,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """Return all accessible incidents, using a short-lived in-memory cache."""
+    global _INCIDENT_CACHE, _INCIDENT_CACHE_LOADED_AT
+
+    now = time.monotonic()
+    cache_age = now - _INCIDENT_CACHE_LOADED_AT
+    cache_valid = (
+        bool(_INCIDENT_CACHE)
+        and INCIDENT_CACHE_TTL_SECONDS > 0
+        and cache_age < INCIDENT_CACHE_TTL_SECONDS
+    )
+    if cache_valid and not refresh:
+        return _INCIDENT_CACHE, True, int(cache_age)
+
+    incidents: list[dict[str, Any]] = []
     page_start = 0
-    page_size = max(1, min(page_size, 10000))
+    page_size = max(1, min(INCIDENT_CACHE_PAGE_SIZE, 10000))
+
     while True:
         data = incident_get(
             "/incidents",
@@ -656,11 +688,20 @@ def iter_all_incidents(page_size: int = 2000):
         page = extract_list(data)
         if not page:
             break
-        for raw in page:
-            yield raw
+        incidents.extend(page)
         if len(page) < page_size:
             break
         page_start += len(page)
+
+    _INCIDENT_CACHE = incidents
+    _INCIDENT_CACHE_LOADED_AT = time.monotonic()
+    return _INCIDENT_CACHE, False, 0
+
+
+def iter_all_incidents(refresh: bool = False):
+    """Yield all incidents from the cache-aware historical incident list."""
+    incidents, _, _ = get_all_incidents_cached(refresh=refresh)
+    yield from incidents
 
 
 @mcp.tool()
@@ -881,12 +922,24 @@ def search_incidents_by_filters(
     operator_name_starts_with: str = "",
     external_number_starts_with: str = "",
     object_id_starts_with: str = "",
-    limit: int = 500,
+    limit: int = 50,
+    offset: int = 0,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Search all accessible TOPdesk incidents using the known search fields."""
-    limit = max(1, min(limit, 2000))
+    """Search all incidents and return one paged result set."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    number_prefix = re.sub(
+        r"\s+", " ", incident_number_starts_with.strip().upper()
+    )
+    if number_prefix and not number_prefix.startswith("S"):
+        number_prefix = f"S {number_prefix}"
+    elif number_prefix.startswith("S"):
+        number_prefix = re.sub(r"^S\s*", "S ", number_prefix)
+
     filters = {
-        "number": incident_number_starts_with,
+        "number": number_prefix,
         "description": description_starts_with,
         "branch": branch_starts_with,
         "type": incident_type_starts_with,
@@ -900,15 +953,17 @@ def search_incidents_by_filters(
     if not any(str(value or "").strip() for value in filters.values()):
         raise ValueError("At least one structured search filter must be provided")
 
-    results=[]
-    scanned=0
-    for raw in iter_all_incidents():
-        scanned += 1
-        incident=transform_incident(raw)
-        requester=extract_requester_name(incident.get("request", ""))
-        caller=caller_display_name(raw.get("caller"))
-        checks=(
-            (incident_number_starts_with, incident.get("number", "")),
+    all_incidents, cache_hit, cache_age_seconds = get_all_incidents_cached(
+        refresh=refresh
+    )
+    matches: list[dict[str, str]] = []
+
+    for raw in all_incidents:
+        incident = transform_incident(raw)
+        requester = extract_requester_name(incident.get("request", ""))
+        caller = caller_display_name(raw.get("caller"))
+        checks = (
+            (number_prefix, incident.get("number", "")),
             (description_starts_with, incident.get("briefDescription", "")),
             (branch_starts_with, incident.get("branch", "")),
             (incident_type_starts_with, incident.get("callType", "")),
@@ -920,23 +975,42 @@ def search_incidents_by_filters(
         )
         if any(
             str(expected).strip()
-            and not str(actual).casefold().startswith(str(expected).strip().casefold())
+            and not str(actual).casefold().startswith(
+                str(expected).strip().casefold()
+            )
             for expected, actual in checks
         ):
             continue
         if requester_name_starts_with:
-            expected=requester_name_starts_with.strip().casefold()
+            expected = requester_name_starts_with.strip().casefold()
             if not requester.casefold().startswith(expected) and not caller.casefold().startswith(expected):
                 continue
-        results.append(incident_result_row(raw))
-        if len(results) >= limit:
-            break
+        matches.append(incident_result_row(raw))
+
+    total_matches = len(matches)
+    page = matches[offset:offset + limit]
+    next_offset = offset + len(page)
+    has_more = next_offset < total_matches
+
     return {
-        "count": len(results),
-        "scannedCount": scanned,
-        "limitReached": len(results) >= limit,
-        "displayColumns": ["Sagsnummer", "Beskrivelse", "Dato tilføjet (oprettet)", "Rekvirentnavn", "Anmoder"],
-        "incidents": results,
+        "count": len(page),
+        "totalMatches": total_matches,
+        "offset": offset,
+        "limit": limit,
+        "hasMore": has_more,
+        "nextOffset": next_offset if has_more else None,
+        "scannedCount": len(all_incidents),
+        "cacheHit": cache_hit,
+        "cacheAgeSeconds": cache_age_seconds,
+        "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
+        "displayColumns": [
+            "Sagsnummer",
+            "Beskrivelse",
+            "Dato tilføjet (oprettet)",
+            "Rekvirentnavn",
+            "Anmoder",
+        ],
+        "incidents": page,
     }
 
 
@@ -1053,40 +1127,73 @@ def find_incidents_created_by_person(
     title_contains: str = "",
     category_contains: str = "",
     subcategory_contains: str = "",
-    limit: int = 1000,
+    limit: int = 50,
+    offset: int = 0,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Find all accessible historical incidents created/requested by a person."""
-    person_name=re.sub(r"\s+", " ", person_name).strip()
+    """Find historical incidents created by a person and return one page."""
+    person_name = re.sub(r"\s+", " ", person_name).strip()
     if not person_name:
         raise ValueError("person_name must not be empty")
-    limit=max(1,min(limit,5000))
-    target=person_name.casefold()
-    results=[]
-    scanned=0
-    for raw in iter_all_incidents():
-        scanned += 1
-        incident=transform_incident(raw)
-        if title_contains and title_contains.casefold() not in incident.get("briefDescription", "").casefold():
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    target = person_name.casefold()
+    all_incidents, cache_hit, cache_age_seconds = get_all_incidents_cached(
+        refresh=refresh
+    )
+
+    matches: list[dict[str, str]] = []
+    for raw in all_incidents:
+        incident = transform_incident(raw)
+        if title_contains and title_contains.casefold() not in incident.get(
+            "briefDescription", ""
+        ).casefold():
             continue
-        if category_contains and category_contains.casefold() not in incident.get("category", "").casefold():
+        if category_contains and category_contains.casefold() not in incident.get(
+            "category", ""
+        ).casefold():
             continue
-        if subcategory_contains and subcategory_contains.casefold() not in incident.get("subcategory", "").casefold():
+        if subcategory_contains and subcategory_contains.casefold() not in incident.get(
+            "subcategory", ""
+        ).casefold():
             continue
-        requester=extract_requester_name(incident.get("request", ""))
-        caller=caller_display_name(raw.get("caller"))
-        if requester.casefold()!=target and caller.casefold()!=target:
+
+        requester = extract_requester_name(incident.get("request", ""))
+        caller = caller_display_name(raw.get("caller"))
+        if requester.casefold() != target and caller.casefold() != target:
             continue
-        results.append(incident_result_row(raw))
-        if len(results)>=limit:
-            break
+        matches.append(incident_result_row(raw))
+
+    total_matches = len(matches)
+    page = matches[offset:offset + limit]
+    next_offset = offset + len(page)
+    has_more = next_offset < total_matches
+
     return {
-        "count":len(results),
-        "searchedPerson":person_name,
-        "scannedCount":scanned,
-        "limitReached":len(results)>=limit,
-        "displayColumns":["Sagsnummer","Beskrivelse","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
-        "presentationInstruction":"Vis alle incidents i den returnerede liste uden at udelade ældre sager.",
-        "incidents":results,
+        "count": len(page),
+        "totalMatches": total_matches,
+        "searchedPerson": person_name,
+        "offset": offset,
+        "limit": limit,
+        "hasMore": has_more,
+        "nextOffset": next_offset if has_more else None,
+        "scannedCount": len(all_incidents),
+        "cacheHit": cache_hit,
+        "cacheAgeSeconds": cache_age_seconds,
+        "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
+        "displayColumns": [
+            "Sagsnummer",
+            "Beskrivelse",
+            "Dato tilføjet (oprettet)",
+            "Rekvirentnavn",
+            "Anmoder",
+        ],
+        "presentationInstruction": (
+            "Vis kun den returnerede side. Hvis hasMore er true, oplys at flere "
+            "resultater kan hentes med nextOffset."
+        ),
+        "incidents": page,
     }
 
 
