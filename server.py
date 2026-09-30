@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import os
 import re
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -550,6 +551,19 @@ def extract_match_context(text: str, needle: str, context: int = 140) -> str:
     return f"{prefix}{cleaned[start:end].strip()}{suffix}"
 
 
+def format_incident_datetime(value: Any) -> str:
+    """Format a TOPdesk timestamp as a full date and time."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.strftime("%d-%m-%Y %H:%M")
+    except (TypeError, ValueError):
+        return text
+
+
 @mcp.tool()
 def health() -> dict[str, Any]:
     """Check configuration and write-operation status."""
@@ -665,11 +679,7 @@ def list_recent_incidents(
     limit: int = 10,
     start: int = 0,
 ) -> dict[str, Any]:
-    """List recent accessible incidents in a fixed service-desk table format.
-
-    Includes both firstLine and secondLine incidents. Status is not returned as
-    a display column.
-    """
+    """List recent firstLine and secondLine incidents in a fixed table format."""
     limit = max(1, min(limit, 100))
     page_start = max(0, start)
     page_size = min(100, max(limit, 25))
@@ -692,9 +702,15 @@ def list_recent_incidents(
 
         for raw in raw_incidents:
             incident = transform_incident(raw)
+            incident_status = incident.get("status", "").casefold()
 
-            # The list endpoint can omit assignment details. Fetch the full
-            # incident only when operator or operator group is missing.
+            # Include both firstLine and secondLine incidents, but do not expose
+            # status as a display column.
+            if incident_status not in {"firstline", "secondline"}:
+                continue
+
+            # TOPdesk can omit assignment information from the list endpoint.
+            # Retrieve the full incident when operator details are missing.
             if not incident.get("operator") or not incident.get("operatorGroup"):
                 incident_id = incident.get("id", "").strip()
                 incident_number = incident.get("number", "").strip()
