@@ -1003,6 +1003,7 @@ def search_incidents_by_filters(
         "cacheHit": cache_hit,
         "cacheAgeSeconds": cache_age_seconds,
         "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
+        "resultType": "table",
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
@@ -1010,6 +1011,12 @@ def search_incidents_by_filters(
             "Rekvirentnavn",
             "Anmoder",
         ],
+        "presentationInstruction": (
+            "Vis altid tableData som en Markdown-tabel. Brug præcis kolonnerne "
+            "i displayColumns og i den angivne rækkefølge. Vis ikke status, "
+            "lukket dato eller andre incidentfelter."
+        ),
+        "tableData": page,
         "incidents": page,
     }
 
@@ -1131,7 +1138,7 @@ def find_incidents_created_by_person(
     offset: int = 0,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Find historical incidents created by a person and return one page."""
+    """Use for questions asking which incidents a person created, submitted, requested or is the requester for. Return a paged table. Do not use general content search for creator questions."""
     person_name = re.sub(r"\s+", " ", person_name).strip()
     if not person_name:
         raise ValueError("person_name must not be empty")
@@ -1182,6 +1189,7 @@ def find_incidents_created_by_person(
         "cacheHit": cache_hit,
         "cacheAgeSeconds": cache_age_seconds,
         "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
+        "resultType": "table",
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
@@ -1190,9 +1198,12 @@ def find_incidents_created_by_person(
             "Anmoder",
         ],
         "presentationInstruction": (
-            "Vis kun den returnerede side. Hvis hasMore er true, oplys at flere "
-            "resultater kan hentes med nextOffset."
+            "Vis altid tableData som en Markdown-tabel. Brug præcis kolonnerne "
+            "i displayColumns og i den angivne rækkefølge. Vis ikke status, "
+            "lukket dato eller andre incidentfelter. Hvis hasMore er true, "
+            "oplys efter tabellen at flere resultater kan hentes med nextOffset."
         ),
+        "tableData": page,
         "incidents": page,
     }
 
@@ -1205,7 +1216,7 @@ def find_incidents_by_name_in_content(
     limit: int = 200,
     scan: int = 5000,
 ) -> dict[str, Any]:
-    """Find incidents where a person's name occurs in incident content.
+    """Use only for general name mentions in request or action text, not for questions about who created, submitted or requested incidents.
 
     Searches request and action text, with an optional title and status filter.
     Use this when the person's name is embedded in the request text rather than
