@@ -41,7 +41,7 @@ KNOWLEDGE_FIELDS = (
 
 INCIDENT_FIELDS = (
     "id,number,briefDescription,request,action,creationDate,modificationDate,"
-    "targetDate,closedDate,status,caller,operator,operatorGroup,category,"
+    "targetDate,closedDate,status,caller,operator,operatorGroup,category,externalNumber,"
     "subcategory,callType,entryType,priority,urgency,impact,branch,location,object,"
     "processingStatus"
 )
@@ -94,12 +94,34 @@ def scalar(value: Any) -> str:
     if isinstance(value, dict):
         return str(
             value.get("name")
+            or value.get("dynamicName")
+            or value.get("displayName")
             or value.get("value")
             or value.get("number")
             or value.get("id")
             or ""
         )
     return str(value or "")
+
+
+def normalize_incident_number(number: str) -> str:
+    value = re.sub(r"\s+", " ", str(number or "").strip()).upper()
+    if re.fullmatch(r"\d{4}-\d{3}", value):
+        return f"S {value}"
+    match = re.fullmatch(r"S\s*(\d{4}-\d{3})", value)
+    return f"S {match.group(1)}" if match else value
+
+
+def incident_number_variants(number: str) -> list[str]:
+    normalized = normalize_incident_number(number)
+    variants = [normalized]
+    if normalized.startswith("S "):
+        variants.extend([normalized.replace("S ", "S", 1), normalized[2:]])
+    return list(dict.fromkeys(value for value in variants if value))
+
+
+def fiql_escape(value: str) -> str:
+    return quote(str(value or "").strip(), safe="-_.~@")
 
 
 def tokenize(query: str) -> list[str]:
@@ -243,6 +265,7 @@ def transform_incident(item: dict[str, Any]) -> dict[str, Any]:
         "modificationDate": str(item.get("modificationDate") or ""),
         "targetDate": str(item.get("targetDate") or ""),
         "closedDate": str(item.get("closedDate") or ""),
+        "externalNumber": str(item.get("externalNumber") or ""),
     }
     for name in (
         "status",
@@ -536,50 +559,6 @@ def build_second_line_payload(
     return payload
 
 
-def extract_incident_creator(request_text: Any) -> str:
-    """Extract the requester name embedded at the start of TOPdesk request text."""
-    text = clean_html(request_text)
-    if not text:
-        return ""
-
-    label_patterns = (
-        r"(?:oprettet af|created by|rekvirent(?:navn)?|anmoder)\s*[:：]\s*([^\n;|]+)",
-    )
-    for pattern in label_patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return re.sub(r"\s+", " ", match.group(1)).strip(" -:;|\t")
-
-    first_line = next(
-        (line.strip() for line in text.splitlines() if line.strip()),
-        "",
-    )
-    first_line_match = re.match(
-        r"^([A-Za-zÆØÅæøåÀ-ÖØ-öø-ÿ'’. -]{2,100})\s*[:：]",
-        first_line,
-    )
-    if first_line_match:
-        return re.sub(r"\s+", " ", first_line_match.group(1)).strip()
-
-    return ""
-
-
-def format_incident_search_row(
-    incident: dict[str, Any],
-    requester_name: str = "",
-) -> dict[str, str]:
-    """Return the fixed incident result columns used by search tools."""
-    return {
-        "Sagsnummer": incident.get("number", ""),
-        "Beskrivelse": incident.get("briefDescription", ""),
-        "Dato tilføjet (oprettet)": format_incident_datetime(
-            incident.get("creationDate", "")
-        ),
-        "Rekvirentnavn": requester_name or "Ikke angivet",
-        "Anmoder": incident.get("caller", "") or "Ikke angivet",
-    }
-
-
 def extract_match_context(text: str, needle: str, context: int = 140) -> str:
     """Return a short excerpt around a case-insensitive text match."""
     cleaned = clean_html(text)
@@ -815,6 +794,55 @@ def list_recent_incidents(
 
 
 @mcp.tool()
+def search_incidents_by_filters(
+    incident_number_starts_with: str = "",
+    description_starts_with: str = "",
+    branch_starts_with: str = "",
+    incident_type_starts_with: str = "",
+    category_starts_with: str = "",
+    subcategory_starts_with: str = "",
+    requester_name_starts_with: str = "",
+    operator_name_starts_with: str = "",
+    external_number_starts_with: str = "",
+    object_id_starts_with: str = "",
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Search current and archived TOPdesk incidents with structured filters."""
+    limit = max(1, min(limit, 500))
+    filters = {
+        "number": incident_number_starts_with,
+        "briefDescription": description_starts_with,
+        "callerBranch.name": branch_starts_with,
+        "callType.name": incident_type_starts_with,
+        "category.name": category_starts_with,
+        "subcategory.name": subcategory_starts_with,
+        "caller.dynamicName": requester_name_starts_with,
+        "operator.name": operator_name_starts_with,
+        "externalNumber": external_number_starts_with,
+        "object.id": object_id_starts_with,
+    }
+    clauses = [f"{field}=={fiql_escape(value)}*" for field, value in filters.items() if str(value or "").strip()]
+    if not clauses:
+        raise ValueError("At least one structured search filter must be provided")
+    data = incident_get("/incidents", params={
+        "pageStart": 0, "pageSize": limit, "sort": "creationDate:desc",
+        "dateFormat": "iso8601", "all": "true", "query": ";".join(clauses),
+        "fields": INCIDENT_FIELDS,
+    })
+    rows=[]
+    for raw in extract_list(data):
+        incident=transform_incident(raw)
+        requester=extract_incident_creator(incident.get("request", ""))
+        rows.append(format_incident_search_row(incident, requester))
+    return {
+        "count": len(rows),
+        "appliedFilters": {k:v for k,v in filters.items() if str(v or "").strip()},
+        "displayColumns": ["Sagsnummer","Beskrivelse","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
+        "incidents": rows,
+    }
+
+
+@mcp.tool()
 def search_incidents(
     query: str,
     limit: int = 7,
@@ -882,237 +910,42 @@ def find_incidents_by_requester(
     requester_name: str,
     title_contains: str = "",
     status: str = "",
-    limit: int = 100,
-    scan: int = 1000,
+    limit: int = 200,
     exact_match: bool = True,
 ) -> dict[str, Any]:
-    """Find incidents by TOPdesk caller/requester.
-
-    This tool only matches the structured caller field. It does not claim that
-    the caller processed or closed the incident.
-    """
+    """Find current and archived incidents by structured TOPdesk requester."""
     requester_name = re.sub(r"\s+", " ", requester_name).strip()
-    title_contains = re.sub(r"\s+", " ", title_contains).strip()
-    status = re.sub(r"\s+", " ", status).strip()
-
     if not requester_name:
         raise ValueError("requester_name must not be empty")
-
-    limit = max(1, min(limit, 500))
-    scan = max(1, min(scan, 5000))
-    requester_filter = requester_name.casefold()
-    title_filter = title_contains.casefold()
-    status_filter = status.casefold()
-
-    matches: list[dict[str, Any]] = []
-    scanned = 0
-    page_start = 0
-    page_size = min(100, scan)
-
-    while scanned < scan and len(matches) < limit:
-        current_page_size = min(page_size, scan - scanned)
-        data = incident_get(
-            "/incidents",
-            params={
-                "pageStart": page_start,
-                "pageSize": current_page_size,
-                "sort": "creationDate:desc",
-                "dateFormat": "iso8601",
-                "fields": INCIDENT_FIELDS,
-            },
-        )
-        raw_incidents = extract_list(data)
-        if not raw_incidents:
-            break
-
-        for raw in raw_incidents:
-            item = transform_incident(raw)
-            scanned += 1
-            caller_name = re.sub(r"\s+", " ", item.get("caller", "")).strip()
-            caller_value = caller_name.casefold()
-            requester_matches = (
-                caller_value == requester_filter
-                if exact_match
-                else requester_filter in caller_value
-            )
-            if not requester_matches:
-                continue
-            if title_filter and title_filter not in item.get("briefDescription", "").casefold():
-                continue
-            if status_filter and status_filter not in item.get("status", "").casefold():
-                continue
-
-            item["requester"] = caller_name
-            item["matchedOn"] = "caller"
-            matches.append(item)
-            if len(matches) >= limit:
-                break
-
-        if len(raw_incidents) < current_page_size:
-            break
-        page_start += len(raw_incidents)
-
+    caller_data=incident_get("/incidents/callers/lookup",params={"pageStart":0,"pageSize":1000})
+    candidates=[]
+    for caller in extract_list(caller_data):
+        if not isinstance(caller,dict):
+            continue
+        caller_name=scalar(caller)
+        matched=(caller_name.casefold()==requester_name.casefold() if exact_match else requester_name.casefold() in caller_name.casefold())
+        caller_id=str(caller.get("id") or caller.get("value") or "").strip()
+        if matched and caller_id:
+            candidates.append({"id":caller_id,"name":caller_name})
+    rows=[]; seen=set()
+    for candidate in candidates:
+        clauses=[f"caller.id=={fiql_escape(candidate['id'])}"]
+        if title_contains.strip(): clauses.append(f"briefDescription==*{fiql_escape(title_contains)}*")
+        if status.strip(): clauses.append(f"status=={fiql_escape(status)}")
+        data=incident_get("/incidents",params={
+            "pageStart":0,"pageSize":min(max(1,limit),500),"sort":"creationDate:desc",
+            "dateFormat":"iso8601","all":"true","query":";".join(clauses),"fields":INCIDENT_FIELDS,
+        })
+        for raw in extract_list(data):
+            incident=transform_incident(raw); number=incident.get("number","")
+            if number in seen: continue
+            seen.add(number); rows.append(format_incident_search_row(incident,candidate["name"]))
+            if len(rows)>=limit: break
+        if len(rows)>=limit: break
     return {
-        "status": "ok",
-        "requesterName": requester_name,
-        "titleContains": title_contains,
-        "statusFilter": status,
-        "exactMatch": exact_match,
-        "scannedCount": scanned,
-        "count": len(matches),
-        "limitReached": len(matches) >= limit,
-        "scanLimitReached": scanned >= scan,
-        "incidents": matches,
-        "note": (
-            "Matched against the structured TOPdesk caller field. "
-            "Caller is not necessarily the operator who processed or closed the incident."
-        ),
-    }
-
-
-@mcp.tool()
-def find_incidents_created_by_person(
-    person_name: str,
-    title_contains: str = "",
-    status: str = "",
-    limit: int = 200,
-    scan: int = 1500,
-) -> dict[str, Any]:
-    """Find incidents whose full request text identifies a specific creator.
-
-    Use this tool when the user asks which incidents a person created, submitted
-    or requested. The optional title filter is applied before detail lookups so
-    targeted searches such as offboarding remain efficient.
-    """
-    person_name = re.sub(r"\s+", " ", person_name).strip()
-    title_contains = re.sub(r"\s+", " ", title_contains).strip()
-    status = re.sub(r"\s+", " ", status).strip()
-
-    if not person_name:
-        raise ValueError("person_name must not be empty")
-
-    limit = max(1, min(limit, 500))
-    scan = max(1, min(scan, 5000))
-    person_filter = person_name.casefold()
-    title_filter = title_contains.casefold()
-    status_filter = status.casefold()
-
-    matches: list[dict[str, str]] = []
-    scanned = 0
-    detail_requests = 0
-    detail_errors = 0
-    page_start = 0
-    page_size = min(100, scan)
-
-    while scanned < scan and len(matches) < limit:
-        current_page_size = min(page_size, scan - scanned)
-        data = incident_get(
-            "/incidents",
-            params={
-                "pageStart": page_start,
-                "pageSize": current_page_size,
-                "sort": "creationDate:desc",
-                "dateFormat": "iso8601",
-                "fields": (
-                    "id,number,briefDescription,creationDate,"
-                    "closedDate,status,caller"
-                ),
-            },
-        )
-        raw_incidents = extract_list(data)
-        if not raw_incidents:
-            break
-
-        for raw in raw_incidents:
-            scanned += 1
-            summary = transform_incident(raw)
-
-            if title_filter and title_filter not in summary.get(
-                "briefDescription", ""
-            ).casefold():
-                continue
-            if status_filter and status_filter not in summary.get(
-                "status", ""
-            ).casefold():
-                continue
-
-            incident_id = summary.get("id", "").strip()
-            incident_number = summary.get("number", "").strip()
-
-            try:
-                if incident_id:
-                    detail_raw = incident_get(
-                        f"/incidents/id/{quote(incident_id, safe='')}",
-                        params={
-                            "dateFormat": "iso8601",
-                            "fields": INCIDENT_FIELDS,
-                        },
-                    )
-                elif incident_number:
-                    detail_raw = incident_get(
-                        f"/incidents/number/{quote(incident_number, safe='')}",
-                        params={
-                            "dateFormat": "iso8601",
-                            "fields": INCIDENT_FIELDS,
-                        },
-                    )
-                else:
-                    continue
-                detail_requests += 1
-            except TopdeskApiError:
-                detail_errors += 1
-                continue
-
-            if not isinstance(detail_raw, dict):
-                continue
-
-            incident = transform_incident(detail_raw)
-            creator_name = extract_incident_creator(
-                incident.get("request", "")
-            )
-
-            if creator_name.casefold() != person_filter:
-                continue
-
-            matches.append(
-                format_incident_search_row(
-                    incident,
-                    requester_name=creator_name,
-                )
-            )
-            if len(matches) >= limit:
-                break
-
-        if len(raw_incidents) < current_page_size:
-            break
-        page_start += len(raw_incidents)
-
-    matches.sort(
-        key=lambda item: item.get("Dato tilføjet (oprettet)", ""),
-        reverse=True,
-    )
-
-    return {
-        "count": len(matches),
-        "searchedCreator": person_name,
-        "titleContains": title_contains,
-        "statusFilter": status,
-        "scannedCount": scanned,
-        "detailRequests": detail_requests,
-        "detailErrors": detail_errors,
-        "limitReached": len(matches) >= limit,
-        "scanLimitReached": scanned >= scan,
-        "displayColumns": [
-            "Sagsnummer",
-            "Beskrivelse",
-            "Dato tilføjet (oprettet)",
-            "Rekvirentnavn",
-            "Anmoder",
-        ],
-        "presentationInstruction": (
-            "Vis alle incidents og kun displayColumns i den angivne rækkefølge."
-        ),
-        "incidents": matches,
+        "count":len(rows),"requesterName":requester_name,"callerCandidates":candidates,
+        "displayColumns":["Sagsnummer","Beskrivelse","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
+        "incidents":rows,
     }
 
 
@@ -1235,16 +1068,29 @@ def get_incident_by_id(incident_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def get_incident_by_number(number: str) -> dict[str, Any]:
-    """Get an incident by number."""
-    number = number.strip()
-    if not number:
-        raise ValueError("number must not be empty")
-    return transform_incident(
-        incident_get(
-            f"/incidents/number/{quote(number, safe='')}",
-            params={"dateFormat": "iso8601"},
-        )
-    )
+    """Get an incident by number, accepting values with or without the S prefix."""
+    variants=incident_number_variants(number)
+    if not variants: raise ValueError("number must not be empty")
+    errors=[]
+    for variant in variants:
+        try:
+            return transform_incident(incident_get(
+                f"/incidents/number/{quote(variant,safe='')}",
+                params={"dateFormat":"iso8601"},
+            ))
+        except TopdeskApiError as error:
+            errors.append(f"{variant}: HTTP {error.status_code}")
+    normalized=variants[0]
+    try:
+        data=incident_get("/incidents",params={
+            "pageStart":0,"pageSize":10,"dateFormat":"iso8601","all":"true",
+            "query":f"number=={fiql_escape(normalized)}","fields":INCIDENT_FIELDS,
+        })
+        items=extract_list(data)
+        if items: return transform_incident(items[0])
+    except TopdeskApiError as error:
+        errors.append(f"fallback: HTTP {error.status_code}")
+    raise ValueError(f"Incident {normalized} was not found. Attempts: "+"; ".join(errors))
 
 
 @mcp.tool()
