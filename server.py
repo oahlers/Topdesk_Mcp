@@ -34,6 +34,11 @@ INCIDENT_CACHE_PAGE_SIZE = int(
 )
 _INCIDENT_CACHE: list[dict[str, Any]] = []
 _INCIDENT_CACHE_LOADED_AT = 0.0
+_REQUESTER_INDEX: dict[str, list[dict[str, Any]]] = {}
+_OPERATOR_INDEX: dict[str, list[dict[str, Any]]] = {}
+_CATEGORY_INDEX: dict[str, list[dict[str, Any]]] = {}
+_SUBCATEGORY_INDEX: dict[str, list[dict[str, Any]]] = {}
+_INCIDENT_NUMBER_INDEX: dict[str, dict[str, Any]] = {}
 WRITE_OPERATIONS_ENABLED = os.getenv(
     "WRITE_OPERATIONS_ENABLED",
     "false",
@@ -646,11 +651,60 @@ def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def build_incident_indexes(incidents: list[dict[str, Any]]) -> None:
+    """Build in-memory indexes for fast requester and metadata searches."""
+    global _REQUESTER_INDEX
+    global _OPERATOR_INDEX
+    global _CATEGORY_INDEX
+    global _SUBCATEGORY_INDEX
+    global _INCIDENT_NUMBER_INDEX
+
+    requester_index: dict[str, list[dict[str, Any]]] = {}
+    operator_index: dict[str, list[dict[str, Any]]] = {}
+    category_index: dict[str, list[dict[str, Any]]] = {}
+    subcategory_index: dict[str, list[dict[str, Any]]] = {}
+    number_index: dict[str, dict[str, Any]] = {}
+
+    for raw in incidents:
+        incident = transform_incident(raw)
+        requester = extract_requester_name(incident.get("request", "")).casefold()
+        caller = caller_display_name(raw.get("caller")).casefold()
+        operator = incident.get("operator", "").casefold()
+        category = incident.get("category", "").casefold()
+        subcategory = incident.get("subcategory", "").casefold()
+        number = normalize_incident_number(incident.get("number", "")).casefold()
+
+        for person_key in {requester, caller}:
+            if person_key:
+                requester_index.setdefault(person_key, []).append(raw)
+        if operator:
+            operator_index.setdefault(operator, []).append(raw)
+        if category:
+            category_index.setdefault(category, []).append(raw)
+        if subcategory:
+            subcategory_index.setdefault(subcategory, []).append(raw)
+        if number:
+            number_index[number] = raw
+
+    _REQUESTER_INDEX = requester_index
+    _OPERATOR_INDEX = operator_index
+    _CATEGORY_INDEX = category_index
+    _SUBCATEGORY_INDEX = subcategory_index
+    _INCIDENT_NUMBER_INDEX = number_index
+
+
 def clear_incident_cache() -> None:
-    """Clear the in-memory incident cache."""
+    """Clear the in-memory incident cache and all derived indexes."""
     global _INCIDENT_CACHE, _INCIDENT_CACHE_LOADED_AT
+    global _REQUESTER_INDEX, _OPERATOR_INDEX
+    global _CATEGORY_INDEX, _SUBCATEGORY_INDEX, _INCIDENT_NUMBER_INDEX
     _INCIDENT_CACHE = []
     _INCIDENT_CACHE_LOADED_AT = 0.0
+    _REQUESTER_INDEX = {}
+    _OPERATOR_INDEX = {}
+    _CATEGORY_INDEX = {}
+    _SUBCATEGORY_INDEX = {}
+    _INCIDENT_NUMBER_INDEX = {}
 
 
 def get_all_incidents_cached(
@@ -667,6 +721,8 @@ def get_all_incidents_cached(
         and cache_age < INCIDENT_CACHE_TTL_SECONDS
     )
     if cache_valid and not refresh:
+        if not _INCIDENT_NUMBER_INDEX:
+            build_incident_indexes(_INCIDENT_CACHE)
         return _INCIDENT_CACHE, True, int(cache_age)
 
     incidents: list[dict[str, Any]] = []
@@ -694,6 +750,7 @@ def get_all_incidents_cached(
         page_start += len(page)
 
     _INCIDENT_CACHE = incidents
+    build_incident_indexes(_INCIDENT_CACHE)
     _INCIDENT_CACHE_LOADED_AT = time.monotonic()
     return _INCIDENT_CACHE, False, 0
 
@@ -719,6 +776,13 @@ def health() -> dict[str, Any]:
         "writeOperationsEnabled": WRITE_OPERATIONS_ENABLED,
         "defaultIncidentLine": "secondLine",
         "defaultEntryType": DEFAULT_ENTRY_TYPE_NAME,
+        "incidentCacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
+        "incidentCacheCount": len(_INCIDENT_CACHE),
+        "requesterIndexKeys": len(_REQUESTER_INDEX),
+        "operatorIndexKeys": len(_OPERATOR_INDEX),
+        "categoryIndexKeys": len(_CATEGORY_INDEX),
+        "subcategoryIndexKeys": len(_SUBCATEGORY_INDEX),
+        "incidentNumberIndexKeys": len(_INCIDENT_NUMBER_INDEX),
     }
 
 
@@ -1149,9 +1213,10 @@ def find_incidents_created_by_person(
     all_incidents, cache_hit, cache_age_seconds = get_all_incidents_cached(
         refresh=refresh
     )
+    indexed_incidents = _REQUESTER_INDEX.get(target, [])
 
     matches: list[dict[str, str]] = []
-    for raw in all_incidents:
+    for raw in indexed_incidents:
         incident = transform_incident(raw)
         if title_contains and title_contains.casefold() not in incident.get(
             "briefDescription", ""
@@ -1185,7 +1250,10 @@ def find_incidents_created_by_person(
         "limit": limit,
         "hasMore": has_more,
         "nextOffset": next_offset if has_more else None,
-        "scannedCount": len(all_incidents),
+        "scannedCount": len(indexed_incidents),
+        "cachedIncidentCount": len(all_incidents),
+        "indexUsed": "requester",
+        "indexKey": target,
         "cacheHit": cache_hit,
         "cacheAgeSeconds": cache_age_seconds,
         "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
