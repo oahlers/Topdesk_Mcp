@@ -934,13 +934,7 @@ def find_incidents_by_name_in_content(
     limit: int = 200,
     scan: int = 5000,
 ) -> dict[str, Any]:
-    """Find incidents where a person's name occurs in incident content.
-
-    Searches request and action text, with an optional title and status filter.
-    Use this when the person's name is embedded in the request text rather than
-    returned in TOPdesk's structured caller field. A match proves only that the
-    name occurs in the specified field, not who processed or closed the case.
-    """
+    """Find incidents where a person's name occurs in full incident content."""
     name = re.sub(r"\s+", " ", name).strip()
     title_contains = re.sub(r"\s+", " ", title_contains).strip()
     status = re.sub(r"\s+", " ", status).strip()
@@ -956,6 +950,8 @@ def find_incidents_by_name_in_content(
 
     matches: list[dict[str, Any]] = []
     scanned = 0
+    detail_requests = 0
+    detail_errors = 0
     page_start = 0
     page_size = min(100, scan)
 
@@ -968,7 +964,10 @@ def find_incidents_by_name_in_content(
                 "pageSize": current_page_size,
                 "sort": "creationDate:desc",
                 "dateFormat": "iso8601",
-                "fields": INCIDENT_FIELDS,
+                "fields": (
+                    "id,number,briefDescription,creationDate,"
+                    "closedDate,status,caller"
+                ),
             },
         )
         raw_incidents = extract_list(data)
@@ -976,33 +975,74 @@ def find_incidents_by_name_in_content(
             break
 
         for raw in raw_incidents:
-            item = transform_incident(raw)
             scanned += 1
+            incident_id = str(raw.get("id") or "").strip()
+            incident_number = str(raw.get("number") or "").strip()
 
+            try:
+                if incident_id:
+                    detail_raw = incident_get(
+                        f"/incidents/id/{quote(incident_id, safe='')}",
+                        params={
+                            "dateFormat": "iso8601",
+                            "fields": INCIDENT_FIELDS,
+                        },
+                    )
+                elif incident_number:
+                    detail_raw = incident_get(
+                        f"/incidents/number/{quote(incident_number, safe='')}",
+                        params={
+                            "dateFormat": "iso8601",
+                            "fields": INCIDENT_FIELDS,
+                        },
+                    )
+                else:
+                    continue
+                detail_requests += 1
+            except TopdeskApiError:
+                detail_errors += 1
+                continue
+
+            if not isinstance(detail_raw, dict):
+                continue
+
+            item = transform_incident(detail_raw)
             title = item.get("briefDescription", "")
             request_text = item.get("request", "")
             action_text = item.get("action", "")
+            caller_text = item.get("caller", "")
 
             if title_filter and title_filter not in title.casefold():
                 continue
             if status_filter and status_filter not in item.get("status", "").casefold():
                 continue
 
-            matched_fields = []
+            matched_fields: list[str] = []
             if name_filter in request_text.casefold():
                 matched_fields.append("request")
             if name_filter in action_text.casefold():
                 matched_fields.append("action")
-
+            if name_filter in caller_text.casefold():
+                matched_fields.append("caller")
             if not matched_fields:
                 continue
 
             item["searchedName"] = name
             item["matchedFields"] = matched_fields
-            item["matchEvidence"] = {
-                field: extract_match_context(item.get(field, ""), name)
-                for field in matched_fields
-            }
+            item["matchEvidence"] = {}
+            if "request" in matched_fields:
+                item["matchEvidence"]["request"] = extract_match_context(
+                    request_text,
+                    name,
+                )
+            if "action" in matched_fields:
+                item["matchEvidence"]["action"] = extract_match_context(
+                    action_text,
+                    name,
+                )
+            if "caller" in matched_fields:
+                item["matchEvidence"]["caller"] = caller_text
+
             matches.append(item)
             if len(matches) >= limit:
                 break
@@ -1011,20 +1051,28 @@ def find_incidents_by_name_in_content(
             break
         page_start += len(raw_incidents)
 
+    matches.sort(
+        key=lambda incident: incident.get("creationDate", ""),
+        reverse=True,
+    )
+
     return {
         "status": "ok",
         "searchedName": name,
         "titleContains": title_contains,
         "statusFilter": status,
-        "searchedFields": ["request", "action"],
+        "searchedFields": ["request", "action", "caller"],
         "scannedCount": scanned,
+        "detailRequests": detail_requests,
+        "detailErrors": detail_errors,
         "count": len(matches),
         "limitReached": len(matches) >= limit,
         "scanLimitReached": scanned >= scan,
         "incidents": matches,
         "note": (
-            "Results show incidents where the name occurs in request or action text. "
-            "A text match does not by itself prove who processed or closed the incident."
+            "Every candidate incident was opened through the TOPdesk incident "
+            "detail endpoint before matching. A result means the name occurs "
+            "in request, action or caller."
         ),
     }
 
