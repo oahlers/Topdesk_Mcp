@@ -638,13 +638,50 @@ def caller_display_name(raw_caller: Any) -> str:
     return "" if is_uuid(value) else value
 
 
+def normalize_business_status(value: Any) -> str:
+    """Normalize TOPdesk processingStatus for user-facing tables."""
+    text = scalar(value).strip()
+    key = re.sub(r"[\s_-]+", " ", text).strip().casefold()
+    mapping = {
+        "registered": "Registreret",
+        "registreret": "Registreret",
+        "assigned": "Tildelt",
+        "tildelt": "Tildelt",
+        "in progress": "Igang",
+        "igang": "Igang",
+        "i gang": "Igang",
+        "waiting for user": "Venter på bruger",
+        "waiting for customer": "Venter på bruger",
+        "venter på bruger": "Venter på bruger",
+        "waiting for supplier": "Venter på leverandør",
+        "waiting for vendor": "Venter på leverandør",
+        "venter på leverandør": "Venter på leverandør",
+        "completed": "Udført",
+        "done": "Udført",
+        "udført": "Udført",
+        "closed": "Lukket",
+        "lukket": "Lukket",
+        "updated by user": "Opdateret af bruger",
+        "updated by customer": "Opdateret af bruger",
+        "opdateret af bruger": "Opdateret af bruger",
+        "updated by supplier": "Opdateret af leverandør",
+        "updated by vendor": "Opdateret af leverandør",
+        "opdateret af leverandør": "Opdateret af leverandør",
+    }
+    if key in {"firstline", "first line", "secondline", "second line"}:
+        return "Ikke angivet"
+    return mapping.get(key, text or "Ikke angivet")
+
+
 def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
     incident = transform_incident(raw)
     requester = extract_requester_name(incident.get("request", ""))
     caller = caller_display_name(raw.get("caller"))
+    processing_status = raw.get("processingStatus") or incident.get("processingStatus", "")
     return {
         "Sagsnummer": incident.get("number", ""),
         "Beskrivelse": incident.get("briefDescription", ""),
+        "Status": normalize_business_status(processing_status),
         "Dato tilføjet (oprettet)": format_incident_datetime(incident.get("creationDate", "")),
         "Rekvirentnavn": requester or caller or "Ikke angivet",
         "Anmoder": caller or requester or "Ikke angivet",
@@ -941,6 +978,9 @@ def list_recent_incidents(
                 {
                     "Sagsnummer": incident.get("number", ""),
                     "Beskrivelse": incident.get("briefDescription", ""),
+                    "Status": normalize_business_status(
+                        incident.get("processingStatus", "")
+                    ),
                     "Anmoder": incident.get("caller", "") or "Ikke angivet",
                     "Ansvarlig": incident.get("operator", "") or "Ikke tildelt",
                     "Gruppe": incident.get("operatorGroup", "") or "Ikke tildelt",
@@ -961,6 +1001,7 @@ def list_recent_incidents(
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
+            "Status",
             "Anmoder",
             "Ansvarlig",
             "Gruppe",
@@ -968,7 +1009,7 @@ def list_recent_incidents(
         ],
         "presentationInstruction": (
             "Vis kun displayColumns i den angivne rækkefølge. "
-            "Vis ikke status eller andre felter i tabellen."
+            "Vis Status fra processingStatus. Vis aldrig firstLine eller secondLine."
         ),
         "incidents": incidents,
     }
@@ -1071,14 +1112,15 @@ def search_incidents_by_filters(
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
+            "Status",
             "Dato tilføjet (oprettet)",
             "Rekvirentnavn",
             "Anmoder",
         ],
         "presentationInstruction": (
             "Vis altid tableData som en Markdown-tabel. Brug præcis kolonnerne "
-            "i displayColumns og i den angivne rækkefølge. Vis ikke status, "
-            "lukket dato eller andre incidentfelter."
+            "i displayColumns og i den angivne rækkefølge. Vis Status fra "
+            "processingStatus. Vis aldrig firstLine eller secondLine."
         ),
         "tableData": page,
         "incidents": page,
@@ -1187,7 +1229,7 @@ def find_incidents_by_requester(
         if len(rows)>=limit: break
     return {
         "count":len(rows),"requesterName":requester_name,"callerCandidates":candidates,
-        "displayColumns":["Sagsnummer","Beskrivelse","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
+        "displayColumns":["Sagsnummer","Beskrivelse","Status","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
         "incidents":rows,
     }
 
@@ -1261,14 +1303,15 @@ def find_incidents_created_by_person(
         "displayColumns": [
             "Sagsnummer",
             "Beskrivelse",
+            "Status",
             "Dato tilføjet (oprettet)",
             "Rekvirentnavn",
             "Anmoder",
         ],
         "presentationInstruction": (
             "Vis altid tableData som en Markdown-tabel. Brug præcis kolonnerne "
-            "i displayColumns og i den angivne rækkefølge. Vis ikke status, "
-            "lukket dato eller andre incidentfelter. Hvis hasMore er true, "
+            "i displayColumns og i den angivne rækkefølge. Vis Status fra "
+            "processingStatus. Vis aldrig firstLine eller secondLine. Hvis hasMore er true, "
             "oplys efter tabellen at flere resultater kan hentes med nextOffset."
         ),
         "tableData": page,
