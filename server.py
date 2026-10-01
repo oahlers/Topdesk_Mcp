@@ -1189,9 +1189,10 @@ def search_incidents_by_filters(
 def search_incidents(
     query: str,
     limit: int = 7,
-    scan: int = INCIDENT_SCAN_LIMIT,
+    scan: int = 0,
+    refresh: bool = False,
 ) -> dict[str, Any]:
-    """Search recent incidents with strict multi-term matching.
+    """Search all accessible current and archived incidents with strict matching.
 
     Every meaningful query term must occur somewhere in the incident. This
     prevents generic words such as 'til' from making an unrelated incident look
@@ -1202,7 +1203,7 @@ def search_incidents(
         raise ValueError("query must not be empty")
 
     limit = max(1, min(limit, 25))
-    scan = max(25, min(scan, 1000))
+    scan = max(0, scan)
 
     stop_words = {
         "af", "alle", "at", "den", "der", "det", "en", "et", "find",
@@ -1216,20 +1217,14 @@ def search_incidents(
 
     normalized_query = re.sub(r"[^\wæøå]+", " ", query.casefold()).strip()
 
-    data = incident_get(
-        "/incidents",
-        params={
-            "pageStart": 0,
-            "pageSize": scan,
-            "sort": "creationDate:desc",
-            "dateFormat": "iso8601",
-            "fields": INCIDENT_FIELDS,
-        },
+    all_incidents, cache_hit, cache_age_seconds = get_all_incidents_cached(
+        refresh=refresh
     )
+    search_scope = all_incidents[:scan] if scan > 0 else all_incidents
 
     results: list[dict[str, Any]] = []
     exact_title_count = 0
-    for raw in extract_list(data):
+    for raw in search_scope:
         item = transform_incident(raw)
         title = item.get("briefDescription", "").casefold()
         searchable_fields = (
@@ -1297,6 +1292,11 @@ def search_incidents(
         "exactTitleMatches": exact_title_count,
         "count": len(selected),
         "references": selected,
+        "searchedIncidentCount": len(search_scope),
+        "cachedIncidentCount": len(all_incidents),
+        "cacheHit": cache_hit,
+        "cacheAgeSeconds": cache_age_seconds,
+        "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
         "instruction": (
             "Return only references from this response. Never select or open an "
             "incident that is not returned. If count is 0, state that no matching "
@@ -1584,7 +1584,8 @@ def find_incidents_by_name_in_content(
     title_contains: str = "",
     status: str = "",
     limit: int = 200,
-    scan: int = 5000,
+    scan: int = 0,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Use only for general name mentions in request or action text, not for questions about who created, submitted or requested incidents.
 
@@ -1601,68 +1602,44 @@ def find_incidents_by_name_in_content(
         raise ValueError("name must not be empty")
 
     limit = max(1, min(limit, 500))
-    scan = max(1, min(scan, 5000))
+    scan = max(0, scan)
     name_filter = name.casefold()
     title_filter = title_contains.casefold()
     status_filter = status.casefold()
 
+    all_incidents, cache_hit, cache_age_seconds = get_all_incidents_cached(
+        refresh=refresh
+    )
+    search_scope = all_incidents[:scan] if scan > 0 else all_incidents
+
     matches: list[dict[str, Any]] = []
     scanned = 0
-    page_start = 0
-    page_size = min(100, scan)
-
-    while scanned < scan and len(matches) < limit:
-        current_page_size = min(page_size, scan - scanned)
-        data = incident_get(
-            "/incidents",
-            params={
-                "pageStart": page_start,
-                "pageSize": current_page_size,
-                "sort": "creationDate:desc",
-                "dateFormat": "iso8601",
-                "fields": INCIDENT_FIELDS,
-            },
-        )
-        raw_incidents = extract_list(data)
-        if not raw_incidents:
+    for raw in search_scope:
+        item = transform_incident(raw)
+        scanned += 1
+        title = item.get("briefDescription", "")
+        request_text = item.get("request", "")
+        action_text = item.get("action", "")
+        if title_filter and title_filter not in title.casefold():
+            continue
+        if status_filter and status_filter not in item.get("status", "").casefold():
+            continue
+        matched_fields = []
+        if name_filter in request_text.casefold():
+            matched_fields.append("request")
+        if name_filter in action_text.casefold():
+            matched_fields.append("action")
+        if not matched_fields:
+            continue
+        item["searchedName"] = name
+        item["matchedFields"] = matched_fields
+        item["matchEvidence"] = {
+            field: extract_match_context(item.get(field, ""), name)
+            for field in matched_fields
+        }
+        matches.append(item)
+        if len(matches) >= limit:
             break
-
-        for raw in raw_incidents:
-            item = transform_incident(raw)
-            scanned += 1
-
-            title = item.get("briefDescription", "")
-            request_text = item.get("request", "")
-            action_text = item.get("action", "")
-
-            if title_filter and title_filter not in title.casefold():
-                continue
-            if status_filter and status_filter not in item.get("status", "").casefold():
-                continue
-
-            matched_fields = []
-            if name_filter in request_text.casefold():
-                matched_fields.append("request")
-            if name_filter in action_text.casefold():
-                matched_fields.append("action")
-
-            if not matched_fields:
-                continue
-
-            item["searchedName"] = name
-            item["matchedFields"] = matched_fields
-            item["matchEvidence"] = {
-                field: extract_match_context(item.get(field, ""), name)
-                for field in matched_fields
-            }
-            matches.append(item)
-            if len(matches) >= limit:
-                break
-
-        if len(raw_incidents) < current_page_size:
-            break
-        page_start += len(raw_incidents)
-
     return {
         "status": "ok",
         "searchedName": name,
@@ -1672,7 +1649,11 @@ def find_incidents_by_name_in_content(
         "scannedCount": scanned,
         "count": len(matches),
         "limitReached": len(matches) >= limit,
-        "scanLimitReached": scanned >= scan,
+        "scanLimitReached": scan > 0 and scanned >= scan,
+        "cachedIncidentCount": len(all_incidents),
+        "cacheHit": cache_hit,
+        "cacheAgeSeconds": cache_age_seconds,
+        "cacheTtlSeconds": INCIDENT_CACHE_TTL_SECONDS,
         "incidents": matches,
         "note": (
             "Results show incidents where the name occurs in request or action text. "
