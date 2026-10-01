@@ -1191,14 +1191,30 @@ def search_incidents(
     limit: int = 7,
     scan: int = INCIDENT_SCAN_LIMIT,
 ) -> dict[str, Any]:
-    """Search recent accessible incidents."""
-    query = query.strip()
+    """Search recent incidents with strict multi-term matching.
+
+    Every meaningful query term must occur somewhere in the incident. This
+    prevents generic words such as 'til' from making an unrelated incident look
+    like a valid match. Exact title matches are ranked first.
+    """
+    query = re.sub(r"\s+", " ", query).strip()
     if not query:
         raise ValueError("query must not be empty")
 
     limit = max(1, min(limit, 25))
     scan = max(25, min(scan, 1000))
-    terms = tokenize(query)
+
+    stop_words = {
+        "af", "alle", "at", "den", "der", "det", "en", "et", "find",
+        "for", "fra", "i", "med", "mig", "og", "på", "sag", "sager",
+        "som", "ticket", "tickets", "til", "vis",
+    }
+    raw_terms = tokenize(query)
+    meaningful_terms = [term for term in raw_terms if term not in stop_words]
+    if not meaningful_terms:
+        meaningful_terms = raw_terms
+
+    normalized_query = re.sub(r"[^\wæøå]+", " ", query.casefold()).strip()
 
     data = incident_get(
         "/incidents",
@@ -1211,27 +1227,60 @@ def search_incidents(
         },
     )
 
-    results = []
+    results: list[dict[str, Any]] = []
+    exact_title_count = 0
     for raw in extract_list(data):
         item = transform_incident(raw)
+        title = item.get("briefDescription", "").casefold()
+        searchable_fields = (
+            item.get("number", "").casefold(),
+            title,
+            item.get("request", "").casefold(),
+            item.get("action", "").casefold(),
+            item.get("category", "").casefold(),
+            item.get("subcategory", "").casefold(),
+            item.get("caller", "").casefold(),
+        )
+        combined_text = " ".join(searchable_fields)
+
+        # A valid result must contain every meaningful query term.
+        matched_terms = [term for term in meaningful_terms if term in combined_text]
+        if meaningful_terms and len(matched_terms) != len(meaningful_terms):
+            continue
+
+        normalized_title = re.sub(r"[^\wæøå]+", " ", title).strip()
+        exact_title = normalized_title == normalized_query
+        title_phrase = normalized_query and normalized_query in normalized_title
+
         weighted_fields = (
-            (item.get("number", "").lower(), 100),
-            (item.get("briefDescription", "").lower(), 30),
-            (item.get("request", "").lower(), 20),
-            (item.get("action", "").lower(), 12),
-            (item.get("category", "").lower(), 10),
-            (item.get("subcategory", "").lower(), 10),
-            (item.get("caller", "").lower(), 6),
+            (item.get("number", "").casefold(), 100),
+            (title, 30),
+            (item.get("request", "").casefold(), 20),
+            (item.get("action", "").casefold(), 12),
+            (item.get("category", "").casefold(), 10),
+            (item.get("subcategory", "").casefold(), 10),
+            (item.get("caller", "").casefold(), 6),
         )
         score = sum(
             weight
-            for term in terms
+            for term in meaningful_terms
             for text, weight in weighted_fields
             if term in text
         )
-        if score:
-            item["relevanceScore"] = score
-            results.append(item)
+        if exact_title:
+            score += 1000
+            exact_title_count += 1
+        elif title_phrase:
+            score += 500
+
+        item["relevanceScore"] = score
+        item["matchType"] = (
+            "exact_title" if exact_title else
+            "title_phrase" if title_phrase else
+            "all_terms"
+        )
+        item["matchedTerms"] = matched_terms
+        results.append(item)
 
     results.sort(
         key=lambda item: (
@@ -1243,8 +1292,17 @@ def search_incidents(
     selected = results[:limit]
     return {
         "query": query,
+        "matchMode": "all_meaningful_terms",
+        "meaningfulTerms": meaningful_terms,
+        "exactTitleMatches": exact_title_count,
         "count": len(selected),
         "references": selected,
+        "instruction": (
+            "Return only references from this response. Never select or open an "
+            "incident that is not returned. If count is 0, state that no matching "
+            "incident was found. If exactTitleMatches is 0, do not claim an exact "
+            "title match."
+        ),
     }
 
 
