@@ -728,15 +728,54 @@ def normalize_business_status(value: Any) -> str:
 
 
 def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
+    """Create one table row and enrich missing business status on demand."""
     incident = transform_incident(raw)
+    processing_status = (
+        raw.get("processingStatus")
+        or incident.get("processingStatus", "")
+    )
+
+    # TOPdesk may omit processingStatus from /incidents list responses.
+    # Fetch only the selected incident detail when that value is missing.
+    if not scalar(processing_status).strip():
+        incident_id = incident.get("id", "").strip()
+        incident_number = incident.get("number", "").strip()
+        try:
+            if incident_id:
+                detail_raw = incident_get(
+                    f"/incidents/id/{quote(incident_id, safe='')}",
+                    params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS},
+                )
+            elif incident_number:
+                detail_raw = incident_get(
+                    f"/incidents/number/{quote(incident_number, safe='')}",
+                    params={"dateFormat": "iso8601", "fields": INCIDENT_FIELDS},
+                )
+            else:
+                detail_raw = {}
+
+            if isinstance(detail_raw, dict) and detail_raw:
+                detail_incident = transform_incident(detail_raw)
+                processing_status = (
+                    detail_raw.get("processingStatus")
+                    or detail_incident.get("processingStatus", "")
+                )
+                # Preserve fuller caller/request values when list data omitted them.
+                for field in ("request", "caller", "creationDate"):
+                    if not incident.get(field) and detail_incident.get(field):
+                        incident[field] = detail_incident[field]
+        except TopdeskApiError:
+            pass
+
     requester = extract_requester_name(incident.get("request", ""))
-    caller = caller_display_name(raw.get("caller"))
-    processing_status = raw.get("processingStatus") or incident.get("processingStatus", "")
+    caller = caller_display_name(raw.get("caller")) or incident.get("caller", "")
     return {
         "Sagsnummer": incident.get("number", ""),
         "Beskrivelse": incident.get("briefDescription", ""),
         "Status": normalize_business_status(processing_status),
-        "Dato tilføjet (oprettet)": format_incident_datetime(incident.get("creationDate", "")),
+        "Dato tilføjet (oprettet)": format_incident_datetime(
+            incident.get("creationDate", "")
+        ),
         "Rekvirentnavn": requester or caller or "Ikke angivet",
         "Anmoder": caller or requester or "Ikke angivet",
     }
