@@ -1316,13 +1316,31 @@ def search_incidents(
         item["matchedTerms"] = matched_terms
         results.append(item)
 
-    results.sort(
-        key=lambda item: (
-            item.get("relevanceScore", 0),
-            item.get("creationDate", ""),
-        ),
-        reverse=True,
-    )
+    def incident_search_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+        """Rank exact matches first and sort equal match types newest first."""
+        match_type = item.get("matchType", "")
+        match_rank = {
+            "exact_title": 3,
+            "title_phrase": 2,
+            "all_terms": 1,
+        }.get(match_type, 0)
+
+        creation_date = str(item.get("creationDate") or "").strip()
+        try:
+            creation_timestamp = datetime.fromisoformat(
+                creation_date.replace("Z", "+00:00")
+            ).timestamp()
+        except (TypeError, ValueError, OSError):
+            creation_timestamp = 0.0
+
+        # Exact-title results are ordered by creation date, not by small score
+        # differences caused by matches in request/action text.
+        if match_type == "exact_title":
+            return (match_rank, creation_timestamp, item.get("relevanceScore", 0))
+
+        return (match_rank, item.get("relevanceScore", 0), creation_timestamp)
+
+    results.sort(key=incident_search_sort_key, reverse=True)
     selected = results[:limit]
     return {
         "query": query,
