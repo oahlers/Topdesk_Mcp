@@ -627,6 +627,63 @@ def build_second_line_payload(
     return payload
 
 
+def prepare_second_line_draft(
+    brief_description: str,
+    caller_id: str,
+    request_text: str,
+    category_id: str,
+    subcategory_id: str,
+    operator_group_id: str,
+    operator_id: str,
+    call_type_id: str = "",
+    impact_id: str = "",
+    urgency_id: str = "",
+    priority_id: str = "",
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate a wizard draft and build its TOPdesk payload once."""
+    missing = required_wizard_fields(
+        brief_description,
+        caller_id,
+        request_text,
+        category_id,
+        subcategory_id,
+        operator_group_id,
+        operator_id,
+    )
+    if missing:
+        return None, {"status": "needs_input", "missingFields": missing}
+
+    if len(brief_description.strip()) > 80:
+        return None, {
+            "status": "needs_input",
+            "message": "Titlen må højst indeholde 80 tegn.",
+        }
+
+    relationship = validate_category_subcategory(
+        category_id.strip(),
+        subcategory_id.strip(),
+    )
+    if not relationship.get("valid"):
+        return None, {
+            "status": "invalid_classification",
+            "message": relationship.get("message"),
+        }
+
+    return build_second_line_payload(
+        brief_description=brief_description,
+        caller_id=caller_id,
+        request_text=request_text,
+        category_id=category_id,
+        subcategory_id=subcategory_id,
+        operator_group_id=operator_group_id,
+        operator_id=operator_id,
+        call_type_id=call_type_id,
+        impact_id=impact_id,
+        urgency_id=urgency_id,
+        priority_id=priority_id,
+    ), None
+
+
 def extract_match_context(text: str, needle: str, context: int = 140) -> str:
     """Return a short excerpt around a case-insensitive text match."""
     cleaned = clean_html(text)
@@ -727,7 +784,10 @@ def normalize_business_status(value: Any) -> str:
     return mapping.get(key, text or "Ikke angivet")
 
 
-def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
+def incident_result_row(
+    raw: dict[str, Any],
+    caller_name: str = "",
+) -> dict[str, str]:
     """Create one table row and enrich missing business status on demand."""
     incident = transform_incident(raw)
     processing_status = (
@@ -768,7 +828,11 @@ def incident_result_row(raw: dict[str, Any]) -> dict[str, str]:
             pass
 
     requester = extract_requester_name(incident.get("request", ""))
-    caller = caller_display_name(raw.get("caller")) or incident.get("caller", "")
+    caller = (
+        caller_name.strip()
+        or caller_display_name(raw.get("caller"))
+        or incident.get("caller", "")
+    )
     return {
         "Sagsnummer": incident.get("number", ""),
         "Beskrivelse": incident.get("briefDescription", ""),
@@ -1158,7 +1222,7 @@ def search_incidents_by_filters(
     all_incidents, cache_hit, cache_age_seconds = get_all_incidents_cached(
         refresh=refresh
     )
-    matches: list[dict[str, str]] = []
+    matching_incidents: list[dict[str, Any]] = []
 
     for raw in all_incidents:
         incident = transform_incident(raw)
@@ -1187,10 +1251,13 @@ def search_incidents_by_filters(
             expected = requester_name_starts_with.strip().casefold()
             if not requester.casefold().startswith(expected) and not caller.casefold().startswith(expected):
                 continue
-        matches.append(incident_result_row(raw))
+        matching_incidents.append(raw)
 
-    total_matches = len(matches)
-    page = matches[offset:offset + limit]
+    total_matches = len(matching_incidents)
+    page = [
+        incident_result_row(raw)
+        for raw in matching_incidents[offset:offset + limit]
+    ]
     next_offset = offset + len(page)
     has_more = next_offset < total_matches
 
@@ -1375,35 +1442,76 @@ def find_incidents_by_requester(
     requester_name = re.sub(r"\s+", " ", requester_name).strip()
     if not requester_name:
         raise ValueError("requester_name must not be empty")
-    caller_data=incident_get("/incidents/callers/lookup",params={"pageStart":0,"pageSize":1000})
-    candidates=[]
+    caller_data, _, _ = get_cached_lookup(
+        "callers:page_size=1000",
+        "/incidents/callers/lookup",
+        params={"pageStart": 0, "pageSize": 1000},
+    )
+    candidates = []
     for caller in extract_list(caller_data):
-        if not isinstance(caller,dict):
+        if not isinstance(caller, dict):
             continue
-        caller_name=scalar(caller)
-        matched=(caller_name.casefold()==requester_name.casefold() if exact_match else requester_name.casefold() in caller_name.casefold())
-        caller_id=str(caller.get("id") or caller.get("value") or "").strip()
+        caller_name = scalar(caller)
+        matched = (
+            caller_name.casefold() == requester_name.casefold()
+            if exact_match
+            else requester_name.casefold() in caller_name.casefold()
+        )
+        caller_id = str(caller.get("id") or caller.get("value") or "").strip()
         if matched and caller_id:
-            candidates.append({"id":caller_id,"name":caller_name})
-    rows=[]; seen=set()
+            candidates.append({"id": caller_id, "name": caller_name})
+
+    matching_incidents: list[tuple[dict[str, Any], str]] = []
+    seen: set[str] = set()
     for candidate in candidates:
-        clauses=[f"caller.id=={fiql_escape(candidate['id'])}"]
-        if title_contains.strip(): clauses.append(f"briefDescription==*{fiql_escape(title_contains)}*")
-        if status.strip(): clauses.append(f"status=={fiql_escape(status)}")
-        data=incident_get("/incidents",params={
-            "pageStart":0,"pageSize":min(max(1,limit),500),"sort":"creationDate:desc",
-            "dateFormat":"iso8601","all":"true","query":";".join(clauses),"fields":INCIDENT_FIELDS,
-        })
+        clauses = [f"caller.id=={fiql_escape(candidate['id'])}"]
+        if title_contains.strip():
+            clauses.append(
+                f"briefDescription==*{fiql_escape(title_contains)}*"
+            )
+        if status.strip():
+            clauses.append(f"status=={fiql_escape(status)}")
+        data = incident_get(
+            "/incidents",
+            params={
+                "pageStart": 0,
+                "pageSize": min(max(1, limit), 500),
+                "sort": "creationDate:desc",
+                "dateFormat": "iso8601",
+                "all": "true",
+                "query": ";".join(clauses),
+                "fields": INCIDENT_FIELDS,
+            },
+        )
         for raw in extract_list(data):
-            incident=transform_incident(raw); number=incident.get("number","")
-            if number in seen: continue
-            seen.add(number); rows.append(format_incident_search_row(incident,candidate["name"]))
-            if len(rows)>=limit: break
-        if len(rows)>=limit: break
+            incident = transform_incident(raw)
+            number = incident.get("number", "")
+            if number in seen:
+                continue
+            seen.add(number)
+            matching_incidents.append((raw, candidate["name"]))
+            if len(matching_incidents) >= limit:
+                break
+        if len(matching_incidents) >= limit:
+            break
+
+    rows = [
+        incident_result_row(raw, caller_name)
+        for raw, caller_name in matching_incidents
+    ]
     return {
-        "count":len(rows),"requesterName":requester_name,"callerCandidates":candidates,
-        "displayColumns":["Sagsnummer","Beskrivelse","Status","Dato tilføjet (oprettet)","Rekvirentnavn","Anmoder"],
-        "incidents":rows,
+        "count": len(rows),
+        "requesterName": requester_name,
+        "callerCandidates": candidates,
+        "displayColumns": [
+            "Sagsnummer",
+            "Beskrivelse",
+            "Status",
+            "Dato tilføjet (oprettet)",
+            "Rekvirentnavn",
+            "Anmoder",
+        ],
+        "incidents": rows,
     }
 
 
@@ -1430,7 +1538,7 @@ def find_incidents_created_by_person(
     )
     indexed_incidents = _REQUESTER_INDEX.get(target, [])
 
-    matches: list[dict[str, str]] = []
+    matching_incidents: list[dict[str, Any]] = []
     for raw in indexed_incidents:
         incident = transform_incident(raw)
         if title_contains and title_contains.casefold() not in incident.get(
@@ -1450,10 +1558,13 @@ def find_incidents_created_by_person(
         caller = caller_display_name(raw.get("caller"))
         if requester.casefold() != target and caller.casefold() != target:
             continue
-        matches.append(incident_result_row(raw))
+        matching_incidents.append(raw)
 
-    total_matches = len(matches)
-    page = matches[offset:offset + limit]
+    total_matches = len(matching_incidents)
+    page = [
+        incident_result_row(raw)
+        for raw in matching_incidents[offset:offset + limit]
+    ]
     next_offset = offset + len(page)
     has_more = next_offset < total_matches
 
@@ -1947,7 +2058,7 @@ def create_incident(
     """
     Create a Second Line incident with mandatory classification and assignment.
     """
-    missing = required_wizard_fields(
+    payload, validation_error = prepare_second_line_draft(
         brief_description,
         caller_id,
         request_text,
@@ -1955,42 +2066,14 @@ def create_incident(
         subcategory_id,
         operator_group_id,
         operator_id,
+        call_type_id,
+        impact_id,
+        urgency_id,
+        priority_id,
     )
-    if missing:
-        return {
-            "status": "needs_input",
-            "missingFields": missing,
-        }
-
-    if len(brief_description.strip()) > 80:
-        return {
-            "status": "needs_input",
-            "message": "Titlen må højst indeholde 80 tegn.",
-        }
-
-    relationship = validate_category_subcategory(
-        category_id.strip(),
-        subcategory_id.strip(),
-    )
-    if not relationship.get("valid"):
-        return {
-            "status": "invalid_classification",
-            "message": relationship.get("message"),
-        }
-
-    payload = build_second_line_payload(
-        brief_description=brief_description,
-        caller_id=caller_id,
-        request_text=request_text,
-        category_id=category_id,
-        subcategory_id=subcategory_id,
-        operator_group_id=operator_group_id,
-        operator_id=operator_id,
-        call_type_id=call_type_id,
-        impact_id=impact_id,
-        urgency_id=urgency_id,
-        priority_id=priority_id,
-    )
+    if validation_error:
+        return validation_error
+    assert payload is not None
 
     if not confirmed:
         return {
@@ -2253,7 +2336,7 @@ def incident_wizard_preview(
     priority_id: str = "",
 ) -> dict[str, Any]:
     """Validate and preview a complete Second Line wizard draft."""
-    missing = required_wizard_fields(
+    payload, validation_error = prepare_second_line_draft(
         brief_description,
         caller_id,
         request_text,
@@ -2261,47 +2344,23 @@ def incident_wizard_preview(
         subcategory_id,
         operator_group_id,
         operator_id,
+        call_type_id,
+        impact_id,
+        urgency_id,
+        priority_id,
     )
-    if missing:
-        return {
-            "status": "needs_input",
-            "step": "incident_details",
-            "missingFields": missing,
-            "message": (
-                "Kategori, underkategori, operatørgruppe og ansvarlig "
-                "skal vælges før preview."
-            ),
-        }
-
-    if len(brief_description.strip()) > 80:
-        return {
-            "status": "needs_input",
-            "message": "Titlen må højst indeholde 80 tegn.",
-        }
-
-    relationship = validate_category_subcategory(
-        category_id.strip(),
-        subcategory_id.strip(),
-    )
-    if not relationship.get("valid"):
-        return {
-            "status": "invalid_classification",
-            "message": relationship.get("message"),
-        }
-
-    payload = build_second_line_payload(
-        brief_description=brief_description,
-        caller_id=caller_id,
-        request_text=request_text,
-        category_id=category_id,
-        subcategory_id=subcategory_id,
-        operator_group_id=operator_group_id,
-        operator_id=operator_id,
-        call_type_id=call_type_id,
-        impact_id=impact_id,
-        urgency_id=urgency_id,
-        priority_id=priority_id,
-    )
+    if validation_error:
+        if validation_error.get("missingFields"):
+            return {
+                **validation_error,
+                "step": "incident_details",
+                "message": (
+                    "Kategori, underkategori, operatørgruppe og ansvarlig "
+                    "skal vælges før preview."
+                ),
+            }
+        return validation_error
+    assert payload is not None
 
     return {
         "status": "confirmation_required",
